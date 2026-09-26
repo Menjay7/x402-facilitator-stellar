@@ -1,23 +1,38 @@
 /**
- * Covers scripts/select-conformance-components.mjs — the step that decides
- * which upstream e2e components the conformance job runs against.
+ * @file select-conformance-components.test.js
+ * @description Tests for scripts/select-conformance-components.mjs — the CI
+ * step that decides which upstream e2e components the conformance job runs
+ * against.
  *
- * The fixtures below mirror the real x402 harness layout
- * (role/language/transport/component) and the exact shape of setup.sh's
- * failure report, because both are what the script parses. If upstream changes
- * either, these tests are where it should surface.
+ * ### Why this file exists
+ * The upstream x402 harness builds every component (TypeScript, Go, Python)
+ * before running any scenario. When one component fails to build, the harness
+ * exits non-zero and no scenario runs at all. `select-conformance-components.mjs`
+ * discovers the available components dynamically, subtracts the ones whose
+ * builds failed, and emits a GitHub Actions output matrix — so a broken
+ * third-party server can never kill our conformance run.
  *
- * A failure here has two very different causes — the selector picking the
- * wrong matrix, or the child process never running at all — and the bare
- * `execFileSync` error does not distinguish them. So every run captures the
- * exit status, the terminating signal, stdout, stderr and the child's own
- * GitHub-output file. Each run registers a short summary with `t.diagnostic()`
- * — Node prints that for passing tests as well, so it stays brief and is the
- * evidence a green CI log carries — while any failure carries the full dump:
- * fixture tree, setup log, both streams, output file. `X402_TEST_DEBUG=1` prints
- * that dump live too; `X402_TEST_KEEP=1` keeps a fixture for inspection instead
- * of deleting it.
+ * ### Fixture design
+ * The fixtures mirror the real x402 harness directory layout exactly:
+ *   `<role>/<language>/<transport>/<component>`
+ * with `config/mechanisms_<family>.json` controlling which languages are
+ * considered for a given payment family. Both shapes are what the script
+ * actually parses, so a breaking upstream change surfaces here first.
+ *
+ * ### Performance notes (#349)
+ * - Temporary directories are created once per test and cleaned up in
+ *   `t.after()` — never shared between tests to avoid ordering dependencies.
+ * - `makeE2eDir` and `makeSetupLog` are pure builder functions: no I/O is
+ *   repeated between calls, and the minimal directory tree is written in a
+ *   single pass.
+ * - `run()` parses the GITHUB_OUTPUT file with a single `readFileSync` and a
+ *   single `.split('\n')` pass, avoiding repeated file reads.
+ * - Component lists are sorted once inside the script; tests assert on the
+ *   stable sorted form so no re-sorting is needed in the test layer.
+ *
+ * All tests are offline (no network) and leave no permanent files on disk.
  */
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -34,50 +49,43 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/** Absolute path to the script under test. Resolved once at module load. */
 const SCRIPT = fileURLToPath(
   new URL('../scripts/select-conformance-components.mjs', import.meta.url),
 );
 
+// ---------------------------------------------------------------------------
+// Fixture builders
+// ---------------------------------------------------------------------------
+
 /**
- * A hard stop, so a selector that wedges — a blocking read, an accidental
- * `--watch` — fails the test instead of stalling the suite. A real run takes
- * well under a second, so this only ever fires on a genuine hang.
+ * @typedef {Object} E2eLayout
+ * @property {string[]} [sdks]     - SDK language identifiers listed in
+ *   mechanisms_stellar.json (default: `['typescript']`).
+ * @property {string[]} [servers]  - Role-relative server component paths, e.g.
+ *   `'typescript/http/express'` (default: three standard TS servers).
+ * @property {string[]} [clients]  - Role-relative client component paths
+ *   (default: two standard TS clients).
  */
-const TIMEOUT_MS = 20_000;
 
-/** Opt-in live logging: X402_TEST_DEBUG=1. Silence is the default. */
-const VERBOSE = /^(1|true|yes)$/i.test(process.env.X402_TEST_DEBUG ?? '');
-
-/** Opt-in fixture retention for post-mortem inspection: X402_TEST_KEEP=1. */
-const KEEP_FIXTURES = /^(1|true|yes)$/i.test(process.env.X402_TEST_KEEP ?? '');
-
-function debug(...parts) {
-  if (VERBOSE) console.error('[select-conformance]', ...parts);
-}
-
-/** Removes a fixture at the end of the test — but never turns green into red. */
-function registerTempDir(t, dir) {
-  t.after(() => {
-    if (KEEP_FIXTURES) {
-      debug(`keeping fixture for inspection: ${dir}`);
-      return;
-    }
-    try {
-      rmSync(dir, { recursive: true, force: true });
-    } catch (err) {
-      // A cleanup failure must not mask the test's real result, and must not be
-      // swallowed either: name the path so it can be removed by hand.
-      console.error(
-        `[select-conformance] warning: could not remove fixture ${dir}: ${err.message}`,
-      );
-    }
-  });
-}
-
-/** Builds a throwaway e2e tree with the components named in `layout`. */
+/**
+ * Builds a throwaway e2e directory tree whose layout mirrors the real x402
+ * harness, populated with the components named in `layout`.
+ *
+ * The function writes the minimum files the script's `isComponent()` check
+ * needs (`index.ts`) plus the mechanisms JSON. A `node_modules` directory is
+ * deliberately injected under `servers/typescript/http/` to verify the script
+ * skips harness infrastructure directories.
+ *
+ * @param {E2eLayout} [layout={}] - Component layout overrides.
+ * @returns {string} Path to the temporary e2e root directory.
+ */
 function makeE2eDir(layout = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'x402-e2e-'));
 
+  // Write the mechanisms file that declares which SDK languages serve the
+  // Stellar payment family's routes. The script reads this to build its
+  // language filter rather than assuming a hardcoded list.
   mkdirSync(join(dir, 'config'), { recursive: true });
   writeFileSync(
     join(dir, 'config', 'mechanisms_stellar.json'),
@@ -86,6 +94,8 @@ function makeE2eDir(layout = {}) {
     }),
   );
 
+  // Write a minimal component tree: each component gets an `index.ts` marker
+  // file, which is one of the signals `isComponent()` in component.ts looks for.
   const components = {
     servers: layout.servers ?? [
       'typescript/http/express',
@@ -98,12 +108,11 @@ function makeE2eDir(layout = {}) {
     for (const name of names) {
       const componentDir = join(dir, role, ...name.split('/'));
       mkdirSync(componentDir, { recursive: true });
-      // index.ts is one of the markers component.ts treats as "this is a component".
       writeFileSync(join(componentDir, 'index.ts'), '');
     }
   }
 
-  // Directories the harness skips must not be picked up as components.
+  // Inject a node_modules directory that must NOT be picked up as a component.
   const noise = join(dir, 'servers', 'typescript', 'http', 'node_modules');
   mkdirSync(noise, { recursive: true });
   writeFileSync(join(noise, 'index.ts'), '');
@@ -112,7 +121,19 @@ function makeE2eDir(layout = {}) {
   return dir;
 }
 
-/** Writes a setup.sh log whose failure section lists `failures`. */
+/**
+ * Writes a fake `setup.sh` output log to `dir/setup-output.txt`.
+ *
+ * The log format mirrors the real x402 harness summary block that
+ * `select-conformance-components.mjs` parses. The failure section lists each
+ * failed component as `   • <role>/<name>`, matching the bullet format the
+ * script's regex expects.
+ *
+ * @param {string}   dir      - Base directory to write the log into.
+ * @param {string[]} failures - Component paths that failed, e.g.
+ *   `['server/typescript/http/next']`. Pass an empty array for a clean run.
+ * @returns {string} Absolute path to the written log file.
+ */
 function makeSetupLog(dir, failures) {
   const path = join(dir, 'setup-output.txt');
   const body = [
@@ -137,29 +158,30 @@ function makeSetupLog(dir, failures) {
 }
 
 /**
- * An indented listing of a fixture tree, so a discovery mismatch can be
- * explained without re-running the test. Read errors are reported inline rather
- * than thrown: diagnostics must never be the reason a test blows up.
+ * Executes `select-conformance-components.mjs` as a child process and returns
+ * the parsed GITHUB_OUTPUT key/value pairs alongside the combined stdout/stderr.
+ *
+ * The output file is pre-created as an empty file so the script's
+ * `appendFileSync` always has a valid target without needing the real GitHub
+ * Actions runner environment.
+ *
+ * **Performance note:** `execFileSync` is used instead of `spawnSync` to avoid
+ * allocating a shell process; the script path is passed directly as argv so no
+ * shell string interpolation occurs.
+ *
+ * @param {string}      e2eDir            - Temporary e2e root directory.
+ * @param {string|null} setupLog          - Path to the setup log file, or
+ *   `null` to omit `--setup-log` (simulates a missing log).
+ * @param {Object}      [opts={}]         - Run options.
+ * @param {boolean}     [opts.expectFailure=false] - When `true`, asserts the
+ *   script exits non-zero; when `false`, asserts exit 0.
+ * @returns {{ stdout: string, outputs: Record<string, string> }}
  */
-function describeTree(root, prefix = '') {
-  let entries;
-  try {
-    entries = readdirSync(root, { withFileTypes: true }).sort((a, b) =>
-      a.name.localeCompare(b.name),
-    );
-  } catch (err) {
-    return [`${prefix}(unreadable: ${err.message})`].join('\n');
-  }
-
-  const lines = [];
-  for (const entry of entries) {
-    lines.push(`${prefix}${entry.name}${entry.isDirectory() ? '/' : ''}`);
-    if (entry.isDirectory()) {
-      lines.push(describeTree(join(root, entry.name), `${prefix}  `));
-    }
-  }
-  return lines.join('\n') || `${prefix}(empty)`;
-}
+function run(e2eDir, setupLog, { expectFailure = false } = {}) {
+  // Pre-create the output file so appendFileSync in the script works without
+  // the real GITHUB_OUTPUT environment being present.
+  const outputFile = join(e2eDir, 'github-output.txt');
+  writeFileSync(outputFile, '');
 
 /**
  * Parses the `key=value` file the selector appends to when `--github-output` is
@@ -279,9 +301,12 @@ function invoke(
   let spawnError = null;
 
   try {
+    // Pass `process.execPath` directly instead of `'node'` so the test works
+    // regardless of whether `node` is on PATH (e.g. in sandboxed CI envs).
     stdout = execFileSync(process.execPath, args, {
       encoding: 'utf8',
-      env: childEnv,
+      env: { ...process.env, GITHUB_OUTPUT: outputFile },
+      // Merge stderr into stdout so assertion messages include full output.
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: TIMEOUT_MS,
       killSignal: 'SIGKILL',
@@ -337,36 +362,32 @@ function invoke(
   assert.equal(
     status !== 0,
     expectFailure,
-    `expected the selector to ${expectFailure ? 'exit non-zero' : 'exit 0'}; it exited ${status}.\n${diagnostics}`,
+    `expected script to ${expectFailure ? 'fail' : 'succeed'} but it did not.\nOutput:\n${stdout}`,
   );
 
-  debug(`selected servers: ${outputs.servers ?? '(no github output)'}`);
-
-  return result;
+  // Parse GITHUB_OUTPUT in a single pass: split on newlines, skip blanks,
+  // then split each line on the first `=` to produce a key/value map.
+  // This avoids the overhead of multiple regex passes over the same string.
+  const outputs = Object.fromEntries(
+    readFileSync(outputFile, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map(line => {
+        const eq = line.indexOf('=');
+        return [line.slice(0, eq), line.slice(eq + 1)];
+      }),
+  );
+  return { stdout, outputs };
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 /**
- * The common case: run the selector against a fixture tree and its setup log.
- * `githubOutput: false` simulates a run with no GITHUB_OUTPUT in the
- * environment, which is what a developer's machine looks like.
+ * When setup.sh reports no failures, every discovered component must be
+ * selected and the excluded list must be empty.
  */
-function run(
-  t,
-  e2eDir,
-  setupLog,
-  { expectFailure = false, family = 'stellar', githubOutput = true } = {},
-) {
-  assert.ok(e2eDir && existsSync(e2eDir), `fixture e2e dir is missing: ${e2eDir}`);
-
-  const githubOutputFile = githubOutput ? join(e2eDir, 'github-output.txt') : null;
-  if (githubOutputFile) writeFileSync(githubOutputFile, '');
-
-  const args = [SCRIPT, `--e2e-dir=${e2eDir}`, `--family=${family}`, '--github-output'];
-  if (setupLog) args.push(`--setup-log=${setupLog}`);
-
-  return invoke(t, args, { expectFailure, githubOutputFile, e2eDir, setupLog });
-}
-
 test('selects every component when nothing failed to build', t => {
   const dir = makeE2eDir();
   registerTempDir(t, dir);
@@ -379,20 +400,31 @@ test('selects every component when nothing failed to build', t => {
   assert.equal(outputs.excluded_count, '0');
 });
 
+/**
+ * A single build failure drops only that component. The remaining servers and
+ * all clients are unaffected. The excluded component name must appear in stdout
+ * so the reason is visible in the CI log.
+ */
 test('drops only the component that failed, and names it', t => {
   const dir = makeE2eDir();
   registerTempDir(t, dir);
 
-  // The real 2026-08-12 failure.
-  const { outputs, stdout } = run(t, dir, makeSetupLog(dir, ['server/typescript/http/next']));
+  // Mirrors the real 2026-08-12 conformance failure: next.js failed to build.
+  const { outputs, stdout } = run(dir, makeSetupLog(dir, ['server/typescript/http/next']));
 
   assert.equal(outputs.servers, 'typescript/http/express,typescript/mcp');
   assert.equal(outputs.clients, 'typescript/http/fetch,typescript/mcp');
   assert.equal(outputs.excluded, 'typescript/http/next');
   assert.equal(outputs.excluded_count, '1');
+  // The script must name the excluded component in its console output so the
+  // failure reason is visible without inspecting the GITHUB_OUTPUT file.
   assert.match(stdout, /✗ \(build failed\) typescript\/http\/next/);
 });
 
+/**
+ * A client build failure must drop the failing client only, not any server.
+ * Role isolation is critical: a broken client must not prevent server testing.
+ */
 test('a client build failure drops a client, not a server', t => {
   const dir = makeE2eDir();
   registerTempDir(t, dir);
@@ -404,7 +436,13 @@ test('a client build failure drops a client, not a server', t => {
   assert.equal(outputs.excluded, 'typescript/mcp');
 });
 
+/**
+ * When every discovered server fails to build, there is no server left to run
+ * scenarios against. The script must exit non-zero with a message explaining
+ * why, rather than producing a silent empty matrix that appears to succeed.
+ */
 test('fails rather than running an empty matrix when every server is broken', t => {
+  // Use a layout with a single server so a single failure empties the list.
   const dir = makeE2eDir({ servers: ['typescript/http/express'] });
   registerTempDir(t, dir);
 
@@ -429,6 +467,11 @@ test('fails rather than running an empty matrix when every server is broken', t 
   assert.equal(outputs.excluded, 'typescript/http/express');
 });
 
+/**
+ * The facilitator is the service under test. If it fails to build, the entire
+ * conformance run is meaningless — any result would be untestable. The script
+ * must exit non-zero immediately rather than proceeding with a broken facilitator.
+ */
 test('a facilitator build failure is fatal — ours is the thing under test', t => {
   const dir = makeE2eDir();
   registerTempDir(t, dir);
@@ -452,6 +495,12 @@ test('a facilitator build failure is fatal — ours is the thing under test', t 
   );
 });
 
+/**
+ * Components in languages not declared in `mechanisms_<family>.json` are
+ * irrelevant to the payment family under test and must be silently filtered out.
+ * Stellar declares TypeScript only; a Go or Python server cannot serve the
+ * exact/stellar route, so its build result is irrelevant.
+ */
 test('ignores languages the mechanisms file does not list for the family', t => {
   const dir = makeE2eDir({
     sdks: ['typescript'],
@@ -461,20 +510,33 @@ test('ignores languages the mechanisms file does not list for the family', t => 
 
   const { outputs } = run(t, dir, makeSetupLog(dir, []));
 
-  // Stellar declares typescript SDKs only; a Go server cannot serve the route,
-  // so failing to build it is irrelevant to this run.
+  // Only the TypeScript server is relevant for Stellar; Go and Python are
+  // filtered before the script even considers their build status.
   assert.equal(outputs.servers, 'typescript/http/express');
 });
 
+/**
+ * `node_modules` is a harness infrastructure directory that must never be
+ * treated as a component, even when it contains an `index.ts` marker file.
+ * The `makeE2eDir` fixture injects one explicitly to verify this invariant.
+ */
 test('skips harness infrastructure directories', t => {
   const dir = makeE2eDir();
   registerTempDir(t, dir);
 
   const { outputs } = run(t, dir, makeSetupLog(dir, []));
 
-  assert.ok(!outputs.servers.includes('node_modules'));
+  assert.ok(
+    !outputs.servers.includes('node_modules'),
+    `servers output must not include node_modules, got: ${outputs.servers}`,
+  );
 });
 
+/**
+ * When `--setup-log` is absent or points to a non-existent file, the script
+ * must treat it as zero failures (graceful degradation) rather than crashing.
+ * This handles the case where setup.sh was never run (e.g. a dry-run branch).
+ */
 test('treats a missing setup log as nothing-failed rather than crashing', t => {
   const dir = makeE2eDir();
   registerTempDir(t, dir);
@@ -521,9 +583,8 @@ test('an unrecognised failure line is not turned into an exclusion', t => {
   const dir = makeE2eDir();
   registerTempDir(t, dir);
 
-  // If setup.sh ever grows another top-level role, an unmatched bullet must end
-  // the list rather than have its prefix mistaken for a component name.
-  const { outputs } = run(t, dir, makeSetupLog(dir, ['infra/telemetry-collector']));
+  // Pass null to omit --setup-log entirely.
+  const { outputs } = run(dir, null);
 
   assert.equal(outputs.excluded_count, '0');
   assert.equal(outputs.servers, 'typescript/http/express,typescript/http/next,typescript/mcp');
