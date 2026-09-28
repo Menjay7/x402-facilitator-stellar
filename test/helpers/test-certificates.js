@@ -52,7 +52,26 @@ function oidBytes(arcs) {
 
 const OID = (...arcs) => der(0x06, oidBytes(arcs));
 const NULL = Buffer.from([0x05, 0x00]);
-const INTEGER = bytes => der(0x02, bytes);
+/**
+ * DER INTEGER, canonicalizing an unsigned big-endian byte string to the
+ * minimal encoding X.690 requires: any redundant leading 0x00 is stripped,
+ * and exactly one is (re)inserted if the high bit would otherwise flip the
+ * sign. Without this, a randomly generated value (e.g. a certificate serial
+ * number) is invalid DER whenever its leading byte happens to need padding
+ * removed or added — OpenSSL then refuses to parse the certificate at all
+ * with `ERR_OSSL_ASN1_ILLEGAL_PADDING`, intermittently and only for the
+ * unlucky byte values (#473 CI flake).
+ */
+function INTEGER(bytes) {
+  let start = 0;
+  while (start < bytes.length - 1 && bytes[start] === 0x00 && (bytes[start + 1] & 0x80) === 0) {
+    start++;
+  }
+  let b = bytes.subarray(start);
+  if (b.length === 0) b = Buffer.from([0x00]);
+  if (b[0] & 0x80) b = Buffer.concat([Buffer.from([0x00]), b]);
+  return der(0x02, b);
+}
 /** BIT STRING with zero unused trailing bits. */
 const BIT_STRING = bytes => der(0x03, Buffer.concat([Buffer.from([0x00]), bytes]));
 const OCTET_STRING = bytes => der(0x04, bytes);

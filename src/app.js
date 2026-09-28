@@ -621,17 +621,36 @@ export async function createApp(
 
                 await processCataloging(req, body, reply, 'settle');
 
+                // These are best-effort side effects on an already-settled,
+                // already-persisted transaction (#344): if the webhook enqueue
+                // or idempotency write throws, the settlement itself must
+                // still be reported as successful to the caller rather than
+                // falling into the outer catch, which would otherwise
+                // overwrite the durable 'settled' record with 'failed' and
+                // tell the caller their payment failed after funds moved.
                 if (
                   !enqueued.atomicallyEnqueued &&
                   enqueued.event &&
                   webhooks &&
                   typeof webhooks.enqueue === 'function'
                 ) {
-                  webhooks.enqueue(enqueued.event);
+                  try {
+                    webhooks.enqueue(enqueued.event);
+                  } catch (err) {
+                    console.error(
+                      `[/settle] webhook enqueue failed for ${idempotencyKey}: ${describeThrown(err)}`,
+                    );
+                  }
                 }
 
                 if (idempotency && replay) {
-                  await idempotency.complete(replay.key, 200, result);
+                  try {
+                    await idempotency.complete(replay.key, 200, result);
+                  } catch (err) {
+                    console.error(
+                      `[/settle] idempotency.complete failed for ${idempotencyKey}: ${describeThrown(err)}`,
+                    );
+                  }
                 }
 
                 audit('settlement', {
@@ -653,7 +672,13 @@ export async function createApp(
               });
 
               if (idempotency && replay) {
-                await idempotency.complete(replay.key, 200, result);
+                try {
+                  await idempotency.complete(replay.key, 200, result);
+                } catch (err) {
+                  console.error(
+                    `[/settle] idempotency.complete failed for ${idempotencyKey}: ${describeThrown(err)}`,
+                  );
+                }
               }
 
               audit('settlement', {
