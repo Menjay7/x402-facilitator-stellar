@@ -4,10 +4,20 @@
  */
 
 import crypto from 'node:crypto';
+import { StrKey } from '@stellar/stellar-sdk';
 
 /** CAIP-2 identifiers. Both are committed deliverables in the RFP, not one or the other. */
 export const TESTNET = 'stellar:testnet';
 export const PUBNET = 'stellar:pubnet';
+
+/**
+ * Minimum length of an API key secret, enforced at boot (#207).
+ *
+ * Exported so the constraint is testable and documented rather than being a
+ * magic number inside the parser. See the check below for why a length floor
+ * is load-bearing here.
+ */
+export const MIN_API_KEY_LENGTH = 32;
 
 /** True when a postgres:// URL carries userinfo — forbidden in Vault mode (#127). */
 function vaultUrlHasUserinfo(url) {
@@ -58,7 +68,11 @@ function parseSecrets(env, pluralKey, singularKey) {
 
   const seen = new Set();
   for (const s of secrets) {
-    if (!s.startsWith('S')) {
+    // A checksum-aware StrKey decode, not a first-character test (#498): a
+    // truncated, wrongly-prefixed or bad-checksum string starts with "S" and
+    // used to pass here, only to fail later inside createEd25519Signer. The
+    // decode is deliberately stateless — the secret is never echoed back.
+    if (!StrKey.isValidEd25519SecretSeed(s)) {
       throw new Error(`Facilitator secret key must be a Stellar secret key (starts with S).`);
     }
     if (seen.has(s)) {
@@ -72,7 +86,8 @@ function parseSecrets(env, pluralKey, singularKey) {
 function parseOptionalSecret(env, key) {
   const raw = env[key]?.trim();
   if (!raw) return null;
-  if (!raw.startsWith('S')) {
+  // Same checksum-aware decode as parseSecrets (#498).
+  if (!StrKey.isValidEd25519SecretSeed(raw)) {
     throw new Error(`${key} must be a valid Stellar secret key (starts with S).`);
   }
   return raw;
@@ -101,6 +116,7 @@ export function resolveConfig(env = process.env) {
       secret: testnetSecrets[0],
       feeBumpSecret: testnetFeeBumpSecret,
       rpcUrl: env.STELLAR_RPC_URL,
+      horizonUrl: env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
       maxTransactionFeeStroops: parsePositiveInt(env.MAX_TX_FEE_STROOPS, {
         name: 'MAX_TX_FEE_STROOPS',
         defaultValue: 50_000,
@@ -117,6 +133,16 @@ export function resolveConfig(env = process.env) {
     .map(k => k.trim())
     .filter(Boolean);
 
+  // Keys revoked without being removed from the list, so the revocation itself
+  // is a reviewable, auditable act and the secret stays out of git history as a
+  // "deleted" line (#207). Compared upper-cased, matching req.keyId.
+  const revokedApiKeyIds = new Set(
+    (env.FACILITATOR_REVOKED_API_KEYS ?? '')
+      .split(',')
+      .map(k => k.trim().toUpperCase())
+      .filter(Boolean),
+  );
+
   const apiKeys = rawApiKeys.map((keyStr, index) => {
     let id = `key_${index}`;
     let secretPart = keyStr;
@@ -131,11 +157,58 @@ export function resolveConfig(env = process.env) {
         `API key id "${id}" contains invalid characters. Key ids must be alphanumeric and underscore only to work with RATE_LIMIT_ overrides.`,
       );
     }
+
+    // Optional third field: expiry, as epoch seconds (#207). Epoch rather than
+    // ISO-8601 because the separator here is `:` and `2026-01-01T00:00:00Z`
+    // contains two more of them. Validated now, enforced per request.
+    let expiresAt = null;
+    const expiryIdx = secretPart.lastIndexOf(':');
+    if (expiryIdx > 0) {
+      const rawExpiry = secretPart.substring(expiryIdx + 1);
+      if (!/^\d+$/.test(rawExpiry)) {
+        throw new Error(
+          `API key "${id}" has an unparseable expiry "${rawExpiry}". Use epoch seconds, e.g. "${id}:<secret>:${Math.floor(Date.now() / 1000) + 86400}".`,
+        );
+      }
+      expiresAt = Number(rawExpiry) * 1000;
+      secretPart = secretPart.substring(0, expiryIdx);
+    }
+
+    // A key is the only thing between an unauthenticated caller and a signed
+    // settlement, and nothing was stopping one from being "a" (#207): the
+    // secret is hashed with a single unsalted SHA-256, which is not a
+    // work factor, so the whole of its strength has to come from the secret
+    // itself. `openssl rand -base64 32` yields 44 characters carrying 256 bits
+    // of entropy; 8 characters of a human-chosen word carries a few dozen. The
+    // floor is not a proof of strength — it is the point below which the
+    // question is not worth arguing.
+    if (secretPart.length < MIN_API_KEY_LENGTH) {
+      throw new Error(
+        `API key "${id}" has a ${secretPart.length}-character secret; at least ${MIN_API_KEY_LENGTH} are required. ` +
+          `Generate one with: openssl rand -base64 32`,
+      );
+    }
+
     return {
       id,
       hash: crypto.createHash('sha256').update(secretPart).digest(),
+      expiresAt,
+      // The id is recorded here too so verification can report *why* a key that
+      // matched was refused, without consulting config again.
+      revoked: revokedApiKeyIds.has(id.toUpperCase()),
     };
   });
+
+  for (const revokedId of revokedApiKeyIds) {
+    if (!apiKeys.some(k => k.id.toUpperCase() === revokedId)) {
+      // Not an error: removing the key from FACILITATOR_API_KEYS is the end
+      // state, and the revocation entry is what makes that safe to do. Warn,
+      // because a typo'd id otherwise revokes nothing at all.
+      console.warn(
+        `FACILITATOR_REVOKED_API_KEYS lists "${revokedId}", which matches no key in FACILITATOR_API_KEYS.`,
+      );
+    }
+  }
 
   // Parse Rate Limits
   const parseLimits = str => {
@@ -165,16 +238,27 @@ export function resolveConfig(env = process.env) {
     return limits;
   };
 
+  /**
+   * Trusted CIDR blocks that bypass rate limiting (#410). Entries are validated
+   * by RateLimiter at boot; a forged X-Forwarded-For header cannot reach this
+   * check because the rate limiter reads only the resolved req.ip.
+   */
+  const rateLimitAllowlist = (env.RATE_LIMIT_ALLOWLIST ?? '')
+    .split(',')
+    .map(entry => entry.trim())
+    .filter(Boolean);
+
   const rateLimits = {
     global: parseLimits(env.RATE_LIMIT_GLOBAL),
     keys: {},
+    allowlist: rateLimitAllowlist,
   };
 
   // Build a set of configured key ids (uppercased) for validation
   const configuredKeyIds = new Set(apiKeys.map(k => k.id.toUpperCase()));
 
   for (const k of Object.keys(env)) {
-    if (k.startsWith('RATE_LIMIT_') && k !== 'RATE_LIMIT_GLOBAL') {
+    if (k.startsWith('RATE_LIMIT_') && k !== 'RATE_LIMIT_GLOBAL' && k !== 'RATE_LIMIT_ALLOWLIST') {
       const keyId = k.substring(11); // remove RATE_LIMIT_
       // Validate that the key id exists in configured API keys (case-insensitive)
       if (!configuredKeyIds.has(keyId.toUpperCase())) {
@@ -205,6 +289,7 @@ export function resolveConfig(env = process.env) {
       secret: pubnetSecrets[0],
       feeBumpSecret: pubnetFeeBumpSecret,
       rpcUrl: env.STELLAR_RPC_URL_PUBNET,
+      horizonUrl: env.HORIZON_URL_PUBNET || 'https://horizon.stellar.org',
       maxTransactionFeeStroops: parsePositiveInt(env.MAX_TX_FEE_STROOPS_PUBNET, {
         name: 'MAX_TX_FEE_STROOPS_PUBNET',
         defaultValue: 50_000,
@@ -301,6 +386,23 @@ export function resolveConfig(env = process.env) {
     metricsPort: env.METRICS_PORT ? Number(env.METRICS_PORT) : null,
 
     /**
+     * Bind address for the dedicated metrics listener (#491). Defaults to
+     * loopback so a METRICS_PORT listener is off the public network unless
+     * the operator opts into a wider bind explicitly (e.g.
+     * METRICS_HOST=0.0.0.0). Unused when METRICS_PORT is unset.
+     */
+    metricsHost: (env.METRICS_HOST ?? '127.0.0.1').trim() || '127.0.0.1',
+
+    /**
+     * AUDIT_LOG_FILE: when set, every audit record is appended to this file as
+     * well as written to stdout, giving the operator a separable retention
+     * surface (#587). Unset keeps the pre-#587 behaviour exactly: stdout only,
+     * no file created, no new boot requirement. An unwritable path is reported
+     * once and audit continues on stdout — see src/audit.js.
+     */
+    auditLogFile: env.AUDIT_LOG_FILE?.trim() || null,
+
+    /**
      * Deployment environment. Unset in the Docker image by default; only used
      * here to decide whether a local .env file is loaded and whether HSTS is
      * sent. Never gate error-detail behaviour on it — see app.js.
@@ -324,6 +426,20 @@ export function resolveConfig(env = process.env) {
     /** Optional shared stores. Unset means in-memory, single-instance. */
     redisUrl: env.REDIS_URL || null,
     databaseUrl: env.DATABASE_URL || null,
+
+    /**
+     * Two-tier catalog search cache (#392). Off by default so the behaviour
+     * change is opt-in: with it on, a discovery search can be answered from
+     * this process's L1 for up to CATALOG_CACHE_L1_TTL_MS, and from a shared
+     * L2 for up to 60s. Freshness is still guaranteed by the catalog write
+     * version, which is part of the cache key — the TTLs only bound memory and
+     * bound how long a *missed* cross-node invalidation can linger.
+     *
+     * Set CATALOG_SEARCH_CACHE=1 to enable. It implies a shared L2 only when
+     * REDIS_URL is also set; without it this is a per-process L1, which is
+     * still the majority of the win because discovery traffic is repetitive.
+     */
+    catalogSearchCache: env.CATALOG_SEARCH_CACHE === '1' || env.CATALOG_SEARCH_CACHE === 'true',
 
     /**
      * CQRS read replica (#121): when DATABASE_URL_REPLICA is set, settlement

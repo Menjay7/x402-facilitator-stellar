@@ -24,7 +24,7 @@ describe('Ledger-based Expiration & Replay Resistance (#159)', () => {
     // codes, so the wire behaviour is observable without a live ledger.
     capture = { verifyCalls: [], seenTx: new Set(), calls: 0 };
     app = await serve({
-      config: testConfig({ apiKeys: ['admin:s3cret'] }),
+      config: testConfig({ apiKeys: ['admin:s3cret-0123456789abcdefghijklmnopqrstuvwxyz'] }),
       facilitator: stubFacilitator({
         verify: async payload => {
           capture.verifyCalls.push({ payload });
@@ -75,7 +75,7 @@ describe('Ledger-based Expiration & Replay Resistance (#159)', () => {
 
   test('verify rejects an expired payload with a machine-readable reason', async () => {
     const res = await app.post('/verify', bodyWithExpirationLedger('expired'), {
-      authorization: 'Bearer s3cret',
+      authorization: 'Bearer s3cret-0123456789abcdefghijklmnopqrstuvwxyz',
     });
     const json = await res.json();
     assert.ok(json.invalidReason, 'verify rejection must carry a non-null reason');
@@ -85,7 +85,7 @@ describe('Ledger-based Expiration & Replay Resistance (#159)', () => {
   test('verify accepts a payload signed at the current ledger (boundary)', async () => {
     const now = Math.floor(Date.now() / 1000);
     const res = await app.post('/verify', bodyWithExpirationLedger(now), {
-      authorization: 'Bearer s3cret',
+      authorization: 'Bearer s3cret-0123456789abcdefghijklmnopqrstuvwxyz',
     });
     assert.equal(res.status, 200);
     assert.equal((await res.json()).isValid, true);
@@ -94,14 +94,14 @@ describe('Ledger-based Expiration & Replay Resistance (#159)', () => {
   test('verify accepts a payload signed before expiry (valid)', async () => {
     const earlier = Math.floor(Date.now() / 1000) - 300;
     const res = await app.post('/verify', bodyWithExpirationLedger(earlier), {
-      authorization: 'Bearer s3cret',
+      authorization: 'Bearer s3cret-0123456789abcdefghijklmnopqrstuvwxyz',
     });
     assert.equal(res.status, 200);
   });
 
   test('settle refuses an expired payload with a distinct machine-readable code', async () => {
     const res = await app.post('/settle', bodyWithExpirationLedger('expired'), {
-      authorization: 'Bearer s3cret',
+      authorization: 'Bearer s3cret-0123456789abcdefghijklmnopqrstuvwxyz',
     });
     const json = await res.json();
     assert.ok(json.errorReason, 'settle rejection must carry a non-null reason');
@@ -112,10 +112,14 @@ describe('Ledger-based Expiration & Replay Resistance (#159)', () => {
     const body = bodyWithExpirationLedger('far_future');
 
     const beforeCalls = capture.calls;
-    const first = await app.post('/settle', body, { authorization: 'Bearer s3cret' });
+    const first = await app.post('/settle', body, {
+      authorization: 'Bearer s3cret-0123456789abcdefghijklmnopqrstuvwxyz',
+    });
     assert.equal(first.status, 200);
 
-    const second = await app.post('/settle', body, { authorization: 'Bearer s3cret' });
+    const second = await app.post('/settle', body, {
+      authorization: 'Bearer s3cret-0123456789abcdefghijklmnopqrstuvwxyz',
+    });
     assert.equal(second.status, 200);
 
     // The settlement store must not have invoked the scheme a second time for
@@ -128,5 +132,44 @@ describe('Ledger-based Expiration & Replay Resistance (#159)', () => {
     const firstBody = await first.json();
     const secondBody = await second.json();
     assert.equal(firstBody.transaction, secondBody.transaction);
+  });
+
+  test('concurrent duplicate authorizations from identical keypair trigger mutual exclusion', async () => {
+    const body = bodyWithExpirationLedger('far_future_concurrent');
+    const beforeCalls = capture.calls;
+
+    // Fire multiple concurrent settle requests with the same payload
+    const concurrentRequests = 5;
+    const promises = Array.from({ length: concurrentRequests }, () =>
+      app.post('/settle', body, {
+        authorization: 'Bearer s3cret-0123456789abcdefghijklmnopqrstuvwxyz',
+      }),
+    );
+
+    const results = await Promise.all(promises);
+
+    // All requests should succeed
+    for (const res of results) {
+      assert.equal(res.status, 200);
+    }
+
+    // The settlement store must have invoked the scheme only once
+    // due to the distributed lock on the idempotency key
+    assert.equal(
+      capture.calls,
+      beforeCalls + 1,
+      'concurrent identical requests must be serialized by the lock, not re-submitted',
+    );
+
+    // All responses should have the same transaction hash
+    const bodies = await Promise.all(results.map(r => r.json()));
+    const firstTx = bodies[0].transaction;
+    for (const body of bodies) {
+      assert.equal(
+        body.transaction,
+        firstTx,
+        'all concurrent requests must return the same transaction',
+      );
+    }
   });
 });

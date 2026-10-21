@@ -33,12 +33,31 @@ export class CatalogStore {
 
   /**
    * Retrieve a single resource by URL and optional toolName.
+   * Reaches the catalog through `GET /discovery/resource` (#222).
    * @param {string} _url
    * @param {string|null} [_toolName=null]
    * @returns {Promise<object|null>}
    */
   async getResource(_url, _toolName = null) {
     throw new Error('CatalogStore.getResource not implemented');
+  }
+
+  /**
+   * Remove a resource from the catalog (#221).
+   *
+   * Removal is permanent and unconditional — it is the operator/seller escape
+   * hatch from a listing that is wrong, hostile or simply withdrawn, so it must
+   * not be routed through the provisional-expiry path (which only ever hides a
+   * verify-created entry, and only until the next upsert resurrects it).
+   *
+   * @param {string} _url
+   * @param {string|null} [_toolName=null]
+   * @returns {Promise<{removed: boolean, resource: object|null}>} `removed` is
+   *   false when nothing matched, so a caller can answer 404 without a second
+   *   read (and without a read-then-delete race).
+   */
+  async deleteResource(_url, _toolName = null) {
+    throw new Error('CatalogStore.deleteResource not implemented');
   }
 
   /**
@@ -65,6 +84,22 @@ export class CatalogStore {
    */
   async pruneExpired() {
     throw new Error('CatalogStore.pruneExpired not implemented');
+  }
+
+  /**
+   * Cheap catalog health snapshot (#584).
+   *
+   * The readiness probe reports catalogue trouble without failing readiness
+   * (the CATALOG RULE in src/readiness.js), and this is the store-side half of
+   * that branch: a pure in-process flag read, so a probe never waits on a
+   * dependency. It must never throw and must never touch the network — a
+   * readiness check that can fail loudly has failed the wrong way.
+   *
+   * @returns {{ok: boolean, reason?: string}} `ok` with a short `reason` when
+   *   the store is not healthy.
+   */
+  healthCheck() {
+    return { ok: true };
   }
 
   /**

@@ -15,13 +15,119 @@ pinned.
 
 ### Added
 
+- Dynamic fee estimation from Horizon `/fee_stats`: p50/p90/p99 fee rates cached
+  for 5s, a bid chosen from request priority and deadline, and a strict clamp to
+  `MAX_TX_FEE_STROOPS`. Stale stats (or the protocol minimum) are used if Horizon
+  is unreachable. New `HORIZON_URL` / `HORIZON_URL_PUBNET` settings; estimators
+  are exposed as `feeEstimators` from `buildFacilitator` (#426).
+- SEP-0007 `web+stellar:pay` URI parser and generator in the SDK
+  (`parsePayUri`, `buildPayUri`, `payUriFromRequirements`), with strict
+  rejection of malformed or ambiguous URIs and a conformance matrix built on the
+  spec's own examples (#424).
+- `npm run test:bench`: a resource-budget benchmark recording peak RSS, CPU
+  utilization and open sockets, writing a markdown report and a run history, and
+  failing on peak RSS above 512 MiB or a duration regression above 20% (#427).
+- `npm run bench:signer`: a parameterised single-signer contention model that
+  reports the ceiling and knee for a given sequence window and round trip, and
+  refuses to report a knee from a sweep that never oversubscribed the signer
+  (#203). With its defaults, one signer settles 3.2/sec (192/min) and stops
+  scaling at 8 in-flight; past the knee throughput *falls*, because rejected
+  submissions cost the same round trip. `docs/OPERATIONS.md` now sizes the
+  signer pool against that number instead of alerting on any non-zero
+  `x402_signer_inflight`.
+- JSON-RPC 2.0 batch requests on the MCP server (stdio and HTTP): members run
+  concurrently with isolated failures, responses are matched by id, and batches
+  over 25 requests are refused. This replaces the previous blanket `-32600`
+  rejection of arrays (#428).
+- Optional mTLS client-certificate authentication for outbound webhooks. A
+  delivery carrying `mtls.ref` is sent with a client certificate resolved from a
+  ref, over a pooled per-credential agent, and still carries the existing HMAC
+  signature when a secret is also configured. Credential references — never key
+  material — are what travel on the Kafka wire record and in the dead-letter
+  store, so rotation no longer requires a redeploy. Unavailable credentials
+  degrade to signature-only delivery with a warning, and a receiver whose
+  certificate fails verification is not retried (#429).
+- Optional two-tier cache for catalog searches, behind `CATALOG_SEARCH_CACHE=1`:
+  an in-process LRU in front of a shared Redis entry, with Redis Pub/Sub
+  invalidation across replicas. The catalog write version is part of the cache
+  key, so a cached search is never stale. Redis being unreachable degrades to
+  querying the catalog directly. Adds the `x402_catalog_cache_lookups_total`
+  series (#392).
+- Semantic discovery over MCP: the `prompts` and `resources` halves of the
+  protocol alongside the existing tools. Four `x402://catalog/…` resources expose
+  the catalog, a search, one resource, and a per-network summary; three prompt
+  templates (`generate_payment_uri`, `query_dispute_status`, `audit_transaction`)
+  describe how to build and inspect a payment. Capabilities are advertised only
+  when the server can serve them. A new input boundary validates every argument
+  against a format — a transaction hash is 64 hex characters, a URL is http(s) —
+  and seller-controlled catalog text is stripped of invisible characters and
+  emitted inside a labelled data block, so a malicious listing cannot smuggle
+  instructions into an agent's context (#391).
 - `CHANGELOG.md`, so an integrator can tell what changed between two commits
   (#212).
+- `GET /discovery/resource?url=…[&toolName=…]`: the point read behind the
+  catalog listing, so a caller who knows a URL does not have to page the whole
+  catalog to find it. Public, like the other discovery reads; a `404` carries
+  reason `resource_not_found` and, deliberately, no cache headers — a cached
+  "does not exist" would outlive the seller's registration (#222).
+- `DELETE /discovery/resource?url=…[&toolName=…]`: removes a listing outright.
+  The entry, its per-`payTo` accounting and its embedding all go, so a later
+  `/verify` re-creates a fresh provisional listing rather than resurrecting the
+  old one. Authenticated, metered against the catalog-write bucket, and audited
+  as `catalog_delete`. Deletion is not scoped to the caller — nothing maps an
+  API key to a `payTo`, so there is no ownership to enforce (#221).
+- Per-key API key expiry and revocation (#207). `FACILITATOR_API_KEYS` entries
+  may carry a third field, an expiry in epoch seconds (`admin:<secret>:1798761600`);
+  `FACILITATOR_REVOKED_API_KEYS` names key ids to refuse. Both are enforced per
+  request, not once at boot, and both are reported as distinct reasons
+  (`expired_api_key`, `revoked_api_key`) so a withdrawn key is distinguishable
+  from a wrong one in the audit trail.
 - Tests for both documented CLI entry points, `validate-discovery` and
   `x402-mcp`, driven from the `package.json` `bin` map (#208).
+- Secure client-IP resolution behind reverse proxies and CDNs, centralised in
+  `src/trust-proxy.js` and wired into `src/app.js` ahead of the IP
+  pseudonymiser. Behind Cloudflare, `CF-Connecting-IP` is honored
+  automatically when the TCP peer is one of Cloudflare's published anycast
+  ranges (the peer check is the trust boundary, so no `TRUST_PROXY` setting
+  is required); from any other peer the header is ignored as client-writable
+  noise. Behind an AWS ALB, `TRUST_PROXY=1` (or the ALB subnet's CIDR in a
+  proxy list) resolves the client address from the rightmost
+  `X-Forwarded-For` entry, which is the only entry a trusted proxy vouches
+  for.
+- Pattern-based CORS origin verification (#414): every `CORS_ALLOWED_ORIGINS`
+  entry is compiled once to an anchored regular expression and matched against
+  each request's `Origin`, so one entry can allowlist a merchant's whole
+  subdomain tree (`https://.*\.merchant\.example`) while an exact origin
+  remains valid configuration — as a pattern, so `.` still matches any
+  character and a literal host must be written `seller\.example\.com`.
+  Anchoring is what stops a pattern being satisfied by a hostname that merely
+  contains the merchant's, and a bare domain (`seller.example.com`) is matched
+  against dot-aligned suffixes of the origin's host. A matched origin is
+  reflected verbatim with `Access-Control-Allow-Credentials: true`; a
+  malformed pattern fails at boot naming the entry rather than misbehaving at
+  the first cross-origin request. Preflights now advertise exactly
+  `Authorization, Content-Type, X-402-Payment` and cache for 24h
+  (`Access-Control-Max-Age: 86400`, previously `600`).
 
 ### Changed
 
+- The container runs with production semantics (#495): the image sets
+  `NODE_ENV=production` and the facilitator service in `docker-compose.yml`
+  pins it, so the production-only HSTS header is sent and a stray `.env` in the
+  build context is no longer loaded at runtime. The image's `CMD` is now
+  `node src/server.js` instead of `npm start`, so SIGTERM/SIGINT reach the
+  server's graceful-shutdown handlers.
+- **Behaviour change:** the dedicated metrics listener binds to `METRICS_HOST`
+  (default `127.0.0.1` loopback) instead of `0.0.0.0` (#491). An operator that
+  relied on scraping `METRICS_PORT` from another host must now set
+  `METRICS_HOST=0.0.0.0` explicitly (behind a firewall or on an internal
+  interface). Unset `METRICS_PORT` behaviour is unchanged.
+- **Breaking:** API key secrets must be at least 32 characters, enforced at boot
+  (#207). The stored digest is a single unsalted SHA-256 — not a work factor — so
+  the secret's own entropy is the whole of the key's strength, and a short one is
+  also cheap to brute-force offline if the digest ever leaks. A deployment with
+  shorter keys will not start until they are regenerated with
+  `openssl rand -base64 32`; the error names the offending key id.
 - Client IP addresses are pseudonymised before they reach a rate-limit bucket
   key or an audit actor, and are no longer written to logs. This makes the
   claim in `docs/PRIVACY.md` true for shared stores (Redis,
@@ -30,9 +136,106 @@ pinned.
 
 ### Fixed
 
+- `npm run env:check` now fails on the other direction of drift: a variable
+  documented in `.env.example` that no code in `src/` reads. Reads that are
+  computed (`env[pluralKey]`, `env[key]`, `env[k]`, `process.env[name]`) and
+  names that are compose-only are excused by a per-name allowlist in
+  `scripts/check-env-doc.mjs`, each citing the line that reads it — and an
+  allowlist entry fails the build once the code it excuses is gone, so the
+  list cannot quietly become the blind spot it was written to close (#504).
+- Signer secrets are validated with a checksum-aware StrKey decode (#498) in
+  `resolveConfig` and `KeyManager`, so a truncated, wrongly-prefixed or
+  bad-checksum secret is refused at boot — or when a remote key source is read —
+  instead of failing later inside the signer factory. Error messages keep their
+  existing wording and never echo the secret.
+- The MCP CLI fails closed on a malformed `MAX_FEE_PER_CALL_STROOPS` or
+  `MAX_SESSION_SPEND_STROOPS`: the error names the variable and the expected
+  unit and the process exits non-zero, instead of a bare `SyntaxError` escaping
+  while the module loads (#497).
+- README merge-conflict residue removed and the docs-links gate widened to the
+  repository root with a conflict-marker scan, so root README damage fails CI
+  (#490).
+- The dedicated `METRICS_PORT` listener now serves the full exposition
+  (registry plus signer-selection series) through the same `renderFullMetrics`
+  function as the app `GET /metrics` route, so signer alert series exist on
+  the scraped endpoint (#492).
+- Bounded outbound deadlines under the house `AbortSignal.timeout` convention:
+  the remote key-source fetch (`KEY_MANAGER_FETCH_TIMEOUT_MS`, default 5s,
+  with a `keys`-field shape check), the reconciliation RPC
+  (`RECONCILIATION_RPC_TIMEOUT_MS`, default 5s) and the three MCP CLI fetches
+  (`MCP_FETCH_TIMEOUT_MS`, default 10s, with a deadline message); MCP
+  spend-cap parsing names the field that failed (#493).
+- A failed re-embed no longer leaves the previous vector attached to a listing
+  whose content has changed (#220). An upsert builds the new entry on top of the
+  existing one, so it inherited the old vector; when the text changed, the dense
+  search leg kept ranking the listing by content that no longer existed — and it
+  did so silently, because a failed re-embed only logs a warning. The stale
+  vector is now dropped synchronously, before the embed is attempted, so the
+  resource ranks lexically while it waits and stays dropped if the re-embed
+  fails. Each vector carries a fingerprint of the text it describes, so an
+  unchanged listing keeps its vector and skips the provider call entirely.
+- The operational probes are no longer counted as payment traffic (#494): the
+  exclusion set in `src/app.js` named `/health/ready`, a path no route in this
+  server registers, so every readiness poll — the Docker HEALTHCHECK, the
+  1-minute external probe `docs/OPERATIONS.md` commits to, every Kubernetes
+  readiness probe — incremented `x402_requests_total{route="/readyz"}`, the
+  counter the payment dashboards and alerts read. The set now names the
+  registered `/readyz`, is exported so `test/observability.test.js` pins every
+  entry to a registered GET route (and the probes, `/healthz` and `/metrics`,
+  stay excluded while `/verify` and `/settle` keep counting), and
+  `docs/OPERATIONS.md` names the routes the app actually serves.
+- An `OPTIONS` preflight can now override the method list its route class
+  advertises. The DLQ routes (`GET /admin/dlq…`) had been advertising
+  `POST, OPTIONS` and `DELETE /discovery/resource` needed a union its class
+  default could not express, so the preflight took a `methods` argument rather
+  than guessing from the policy name.
+- Dependency advisories published 2026-10-02 cleared: `fastify` 5.12.5 (five
+  high-severity issues, including an authentication bypass through malformed
+  URLs), `@grpc/grpc-js` 1.14.5 (error-message leakage), and `axios` 1.20.0
+  pinned through a top-level `overrides` because `@stellar/stellar-sdk` pins it
+  exactly. `@stellar/stellar-sdk` moves to 16.3.1 inside the existing
+  `^16.2.0` range, so no direct dependency requirement changes.
+  `npm audit --audit-level=high` now reports 0 vulnerabilities.
+- Catalog descriptions are truncated at 200 characters without splitting a
+  surrogate pair (#218). A description whose 200th UTF-16 code unit was the high
+  half of an astral character (an emoji in a listing blurb) previously reached
+  discovery with an unpaired surrogate attached — not valid UTF-16, rendered as
+  U+FFFD by a conformant client and not round-trippable through a `jsonb`
+  column. The emitted description is now always valid UTF-16 and never longer
+  than 200 code units. The truncation is reported in a new `truncated` list on
+  the envelope rather than as a soft drop (#219, below).
 - `server.js` now installs `unhandledRejection` / `uncaughtException` handlers
   and reports a listen or metrics-listener bind failure, exiting non-zero with
   a diagnostic instead of dying silently (#205).
+- A facilitator throwing a non-Error value (an object, a number) no longer
+  surfaces `[object Object]` as `invalidMessage`/`errorMessage`: objects are
+  JSON-stringified so their content reaches the client, while Error messages
+  and strings pass through unchanged (#369).
+- The `EXTENSION-RESPONSES` header on catalogable payments is now encoded
+  lazily, when the response is actually serialized, instead of eagerly on
+  every verify/settle. The bytes a bazaar client receives are unchanged
+  (pinned byte-for-byte by tests); callers that never read the header no
+  longer pay the JSON+base64 cost per payment (#368).
+- `EXTENSION-RESPONSES` is now bounded to 4096 encoded bytes (#202). The
+  envelope is built from caller-controlled fields and was previously unlimited;
+  a header over a proxy's cap does not arrive truncated, it kills the response
+  — after settlement. Envelopes that fit are byte-identical to before. Ones
+  that do not degrade in tiers (drop `reason`, then all detail) while always
+  preserving `status`, and each degradation is logged.
+- A `description` containing markup is now refused rather than sanitized
+  (#217). The previous tag-stripping regex was a sanitizer, not a boundary:
+  `<scr<script>ipt>` stripped *to* `<script>`, `&lt;script&gt;` was not matched
+  at all, and a truncated `onerror` tag with no closing `>` vanished silently.
+  The field is dropped and the rest of the listing still lands
+  (`partially landed`). A bare `&` — "Weather & tides" — is not markup and is
+  unaffected.
+- Truncated fields are reported in a new `truncated` list on the
+  `EXTENSION-RESPONSES` envelope and the `POST /discovery/resources` response,
+  separate from `softDrops` (#219). Previously a description shortened to 200
+  characters was reported as the soft drop `description_truncated`, which read
+  as "this field was dropped" — it was not, and no such field exists. A
+  truncated description now reports `truncated: ["description"]` and leaves
+  `reason`'s dropped-fields list alone.
 
 ## [0.0.1] - 2026-08-11
 

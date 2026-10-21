@@ -25,6 +25,8 @@ upstream it is marked and stopped.
 | GET | `/settlements/:idempotencyKey/events` | API key | no | `{ ok, idempotencyKey, events }` or `404` |
 | POST | `/discovery/resources` | API key | yes (catalog write) | `{ ok, resource, softDrops }` or `400` |
 | GET | `/discovery/resources` | none (public) | yes (catalog read) | `{ x402Version, items, pagination }` |
+| GET | `/discovery/resource` | none (public) | yes (catalog read) | `{ x402Version, resource }`, `400` without `url`, `404` `resource_not_found` (#222) |
+| DELETE | `/discovery/resource` | API key (or open) | yes (catalog write) | `{ ok, removed }`, `400` without `url`, `404` `resource_not_found` (#221) |
 | GET | `/discovery/search` | none (public) | yes (catalog read) | `{ x402Version, resources, partialResults, pagination }` |
 | OPTIONS | all of the above | none (preflight) | no | `204` |
 | * | unknown | — | — | `404 { error: not_found, reason: route_not_found }` |
@@ -62,9 +64,11 @@ cataloguing outcome. Verified over real HTTP (see
 | Outcome | Decoded envelope | Reached by |
 |---|---|---|
 | landed | `{ "bazaar": { "status": "landed", "code": "catalog_success" } }` | valid discovery extension, no soft drops |
-| partially landed | `{ "bazaar": { "status": "partially landed", "code": "catalog_partial", "reason": "Dropped fields: …" } }` | valid extension with one or more soft-dropped fields (e.g. bad `iconUrl`) |
+| partially landed | `{ "bazaar": { "status": "partially landed", "code": "catalog_partial", "reason": "Dropped fields: …" } }` | valid extension with one or more soft-dropped fields (e.g. bad `iconUrl`, or a `description` containing markup) |
+| partially landed (truncation) | `{ "bazaar": { "status": "partially landed", "code": "catalog_partial", "reason": "Truncated fields: description", "truncated": ["description"] } }` | a `description` over 200 characters was stored, shortened. Reported in `truncated`, never in `reason`'s dropped-fields list (#219) |
 | rejected | `{ "bazaar": { "status": "rejected", "code": "catalog_rate_limited" | "invalid_routeTemplate" | … } }` | hard drop (hostile routeTemplate, invalid schema) or catalog write rate-limited |
 | not attempted | `{ "bazaar": { "status": "not attempted" } }` | no discovery extension, or (post-F2) a malformed extension that previously dropped the header |
+| any (degraded) | `{ "bazaar": { "status": …, "code": "extension_response_omitted", "detail_omitted": true } }` | the encoded header would have exceeded 4096 bytes; `status` is preserved and the rest shed (#202) |
 
 ## Headers, per route
 
@@ -88,7 +92,13 @@ cataloguing outcome. Verified over real HTTP (see
   `test/rate-limit-headers.test.js`, which counts header writes per request.
 - **`EXTENSION-RESPONSES`**: set on the `/verify` (automatic) and `/settle`
   cataloguing paths; always base64 of `{ bazaar: outcome }`. Now guaranteed
-  present even when cataloguing parsing throws (F2).
+  present even when cataloguing parsing throws (F2). **Bounded to 4096 encoded
+  bytes (#202):** the value is built from caller-controlled fields, and a
+  header over a proxy's cap kills the response after settlement rather than
+  truncating it. Envelopes that fit are byte-identical to the unbounded
+  encoding; ones that do not degrade in tiers, preserving `status`. Pinned by
+  `test/extension-responses-size.test.js` and an end-to-end case here that
+  drives a 64 KiB description and asserts the wire header stays in bounds.
 - **`Content-Type`**: `application/json` on every JSON route (incl. all 4xx /
   5xx error bodies), `text/plain` on `/metrics`. Verified across the route
   matrix (headers test).

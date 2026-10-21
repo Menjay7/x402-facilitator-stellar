@@ -6,11 +6,61 @@ import {
   extractDiscoveryInfo,
   validateDiscoveryExtension,
 } from '@x402/extensions';
-import { validateAmount } from '../sdk/validation.js';
+import { validateAmount, STELLAR_DECIMALS } from '../sdk/validation.js';
 
 // Pre-compiled regex patterns to avoid recompilation overhead and garbage collection pressure
 const ROUTE_PARAM_REGEX = /\{([^}]+)\}/g;
-const HTML_TAG_REGEX = /<[^>]*>?/gm;
+
+/**
+ * Markup in a description, in either of the two forms that matter (#217).
+ *
+ * The old guard was a tag-stripping regex (`/<[^>]*>?/gm`), which is a
+ * sanitizer, not a boundary: it cannot be. `<scr<script>ipt>` strips to
+ * `<script>`; `<img src=x onerror=alert(1)>` loses the tag but the payload
+ * text survives; `&lt;script&gt;` is untouched and is markup to every consumer
+ * that entity-decodes; and a truncated `<img src=x onerror=...` with no
+ * closing `>` matches the optional-tail alternative and disappears, hiding
+ * that anything was refused at all.
+ *
+ * Refusing is the only defensible policy: a description is prose, and prose
+ * that needs angle brackets to say what it means is not something the catalog
+ * can safely store. `&` is matched only when it begins a markup entity
+ * (`&lt;`, `&gt;`, `&#60;`, `&#x3c;`), so "Tom & Jerry" still passes. Both
+ * entity spellings HTML allows are covered — a leading `0*` for zero-padded
+ * numerics and `[xX]` for either hex prefix, since `&#X3C;` is as valid as
+ * `&#x3c;` and would otherwise be the one way through.
+ *
+ * Deliberately not a global regex: it is used with `.test()`, and a `g` flag
+ * would make that call stateful across invocations.
+ */
+const MARKUP_PATTERN = /<[a-zA-Z/!]|&(?:lt|gt|#0*6[02]|#[xX]0*3[cC]);/;
+
+/** Longest description the catalog will index, in UTF-16 code units. */
+const MAX_DESCRIPTION_LENGTH = 200;
+
+/**
+ * Truncates a description to at most `maxLength` UTF-16 code units without
+ * splitting a surrogate pair (#218).
+ *
+ * `String.prototype.slice`/`substring` cut on code-unit boundaries, so a cut
+ * landing between the two halves of an astral character (an emoji in a listing
+ * blurb) leaves an unpaired surrogate behind. That is not valid UTF-16: it
+ * survives `JSON.stringify` as a lone `\udXXX` escape which conformant clients
+ * reject or render as U+FFFD, and it cannot be round-tripped through a
+ * `jsonb` column. Losing one code unit off the end is strictly better than
+ * emitting a value that is not text.
+ *
+ * The fast path returns the input untouched when it already fits, so the
+ * common short description pays nothing for the guard.
+ */
+function truncateDescription(value, maxLength = MAX_DESCRIPTION_LENGTH) {
+  if (value.length <= maxLength) return value;
+  // Walking back one unit when the cut lands on a high surrogate keeps the
+  // pair whole; the result is then at most maxLength - 1 code units long.
+  const boundary = value.charCodeAt(maxLength - 1);
+  const end = boundary >= 0xd800 && boundary <= 0xdbff ? maxLength - 1 : maxLength;
+  return value.slice(0, end);
+}
 
 /**
  * Distinguishes a hostile routeTemplate (path traversal, protocol smuggling,
@@ -42,6 +92,13 @@ function createResult() {
     hardDrop: false,
     reason: null,
     softDrops: [],
+    // Fields that were kept but shortened. Reported separately from
+    // softDrops (#219): a drop means the seller's value is gone, a
+    // truncation means part of it is. Folding the two together told a
+    // seller "description_truncated was dropped", which is not a thing
+    // that can happen — and left a caller unable to tell which of its
+    // fields had actually been discarded.
+    truncations: [],
     advisories: [],
     resource: null,
   };
@@ -73,7 +130,7 @@ function addAdvisories(result, declaration) {
   }
 }
 
-function validatePolicy(paymentPayload, paymentRequirements, result) {
+function validatePolicy(paymentPayload, paymentRequirements, result, assetDecimalsMap = null) {
   let extracted;
   try {
     extracted = extractDiscoveryInfo(paymentPayload, paymentRequirements, false);
@@ -106,6 +163,21 @@ function validatePolicy(paymentPayload, paymentRequirements, result) {
         result.hardDrop = true;
         result.reason = 'invalid_pricing_amount';
         return result;
+      }
+      // Reject sub-stroop fractions instead of truncating them (#415): an
+      // amount carrying more precision than its asset supports would settle
+      // short of what the seller stated, silently. The asset's decimals come
+      // from the fetched per-asset cache when available, else the 7-decimal
+      // Stellar default.
+      const asset = rawBazaar.pricing.asset ?? paymentRequirements.asset ?? 'native';
+      const decimals = assetDecimalsMap?.[asset] ?? STELLAR_DECIMALS;
+      if (typeof rawBazaar.pricing.amount === 'string') {
+        const [, fracPart = ''] = rawBazaar.pricing.amount.split('.');
+        if (fracPart.length > decimals) {
+          result.hardDrop = true;
+          result.reason = 'invalid_pricing_amount';
+          return result;
+        }
       }
     }
   }
@@ -142,14 +214,27 @@ function validatePolicy(paymentPayload, paymentRequirements, result) {
 
   const rawDescription = paymentPayload.resource?.description;
   if (typeof rawDescription === 'string') {
-    let description = rawDescription.includes('<')
-      ? rawDescription.replace(HTML_TAG_REGEX, '').trim()
-      : rawDescription.trim();
-    if (description.length > 200) {
-      description = description.substring(0, 200);
-      result.softDrops.push('description_truncated');
+    const description = rawDescription.trim();
+    // The `includes` guard is a fast path only: every description without a
+    // `<` or `&` skips the regex entirely, so ordinary prose (the overwhelming
+    // majority) pays nothing. The regex is the decision, not this test.
+    if (
+      (description.includes('<') || description.includes('&')) &&
+      MARKUP_PATTERN.test(description)
+    ) {
+      result.softDrops.push('description');
+      // extractDiscoveryInfo has already populated `extracted.description`
+      // from the same source field, so refusing means deleting it — not
+      // merely declining to assign it. Without this the refused markup is
+      // still stored, via the copy this function never wrote.
+      delete extracted.description;
+    } else if (description.length > MAX_DESCRIPTION_LENGTH) {
+      // Kept, not dropped: shortening is not discarding (#219).
+      extracted.description = truncateDescription(description);
+      result.truncations.push('description');
+    } else {
+      extracted.description = description;
     }
-    extracted.description = description;
   }
 
   const rawTags = paymentPayload.resource?.tags;
@@ -209,7 +294,7 @@ function validatePolicy(paymentPayload, paymentRequirements, result) {
  * directly; SDK declarations are adapted into the same Bazaar extension shape.
  * Seller-only guidance is returned as advisories and never changes admission.
  */
-export function validateDiscoveryPolicy(input, paymentRequirements = {}) {
+export function validateDiscoveryPolicy(input, paymentRequirements = {}, assetDecimalsMap = null) {
   const result = createResult();
   if (!input || typeof input !== 'object') {
     result.hardDrop = true;
@@ -231,7 +316,12 @@ export function validateDiscoveryPolicy(input, paymentRequirements = {}) {
       result.reason = 'invalid_declaration';
       return result;
     }
-    return validatePolicy(input.paymentPayload, input.paymentRequirements, result);
+    return validatePolicy(
+      input.paymentPayload,
+      input.paymentRequirements,
+      result,
+      assetDecimalsMap,
+    );
   }
 
   addAdvisories(result, input);
@@ -275,10 +365,15 @@ export function validateDiscoveryPolicy(input, paymentRequirements = {}) {
       payTo: input.payTo || paymentRequirements.payTo || '',
     },
     result,
+    assetDecimalsMap,
   );
   return policy;
 }
 
-export function validateForCatalog(paymentPayload, paymentRequirements) {
-  return validateDiscoveryPolicy({ paymentPayload, paymentRequirements });
+export function validateForCatalog(paymentPayload, paymentRequirements, assetDecimalsMap = null) {
+  return validateDiscoveryPolicy(
+    { paymentPayload, paymentRequirements },
+    paymentRequirements,
+    assetDecimalsMap,
+  );
 }

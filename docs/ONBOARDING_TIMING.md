@@ -53,9 +53,9 @@ number for the proposal.
 |---|------|------|-----------------|
 | 1 | `git clone` + `npm install` | | |
 | 2 | `npm run lint` + `npm test` pass on a clean machine | | |
-| 3 | Create + fund a testnet account (`npm run fund:testnet`) | | e.g. Friendbot throttle |
-| 4 | Establish USDC trustline(s) (covered by `fund:testnet`) | | |
-| 5 | Obtain testnet USDC on the payer (`npm run prepare:testnet-usdc`) | | treasury secret absent → `usdc_ready=false` |
+| 3 | Create + fund a testnet account (`npm run testnet:fund`) | | e.g. Friendbot throttle |
+| 4 | Establish USDC trustline(s) (covered by `testnet:fund`) | | |
+| 5 | Obtain testnet USDC on the payer (`npm run testnet:usdc`) | | treasury secret absent → `usdc_ready=false` |
 | 6 | Configure the facilitator (`.env`, `FACILITATOR_SECRET`, RPC) | | |
 | 7 | Start the facilitator; `/healthz` + `/readyz` green | | |
 | 8 | Wire the seller integration (e.g. `examples/http-seller`) | | |
@@ -73,7 +73,7 @@ These are the documented places where the hour is likely to be consumed; record
 each occurrence rather than working around it silently:
 
 - **Friendbot throttling** on account funding (retry backoff) → Step 3.
-- **Treasury secret absent** — `prepare:testnet-usdc` honestly reports
+- **Treasury secret absent** — `testnet:usdc` honestly reports
   `usdc_ready=false` and the USDC funding must be skipped → Step 5.
 - **Trustline auth** — an account cannot hold issued USDC until it has
   authorized the issuer; the most common first-payment failure → Step 4/9.
@@ -99,7 +99,7 @@ The issue expects follow-up issues for the biggest costs. Candidates already
 visible today:
 
 - Wire the testnet setup scripts into `README.md`/`package.json` so a cold
-  reader finds `npm run fund:testnet` and `npm run prepare:testnet-usdc`
+  reader finds `npm run testnet:fund` and `npm run testnet:usdc`
   (this is already partially done — verify during Step 3/5).
 - A time-boxed "document the USDC treasury prerequisite" follow-up so `usdc_ready`
   is never a silently skipped step.

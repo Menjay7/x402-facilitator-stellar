@@ -11,10 +11,10 @@ The seller example this agent pays prices in **XLM**, the native asset, which ne
 ```bash
 # From the repo root — funds three fresh testnet accounts AND opens a USDC
 # trustline on each (see scripts/fund-testnet-accounts.mjs)
-npm run fund:testnet
+npm run testnet:fund
 ```
 
-For an existing agent account, `npm run prepare:testnet-usdc` (with `CLIENT_STELLAR_PRIVATE_KEY` / `SERVER_STELLAR_ADDRESS` / `SERVER_STELLAR_PRIVATE_KEY` set) adds the USDC trustline and funds the payer — see the [Buyer / Agent Guide](../../docs/BUYER.md#trustlines) for the concept, both networks, and the exact commands.
+For an existing agent account, `npm run testnet:usdc` (with `CLIENT_STELLAR_PRIVATE_KEY` / `SERVER_STELLAR_ADDRESS` / `SERVER_STELLAR_PRIVATE_KEY` set) adds the USDC trustline and funds the payer — see the [Buyer / Agent Guide](../../docs/BUYER.md#trustlines) for the concept, both networks, and the exact commands.
 
 ## Prerequisites
 - Node.js >= 20

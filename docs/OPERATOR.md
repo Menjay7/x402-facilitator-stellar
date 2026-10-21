@@ -91,14 +91,14 @@ The complete env-var table and topology guidance are in
 
 ## 2. Every environment variable
 
-`docs/DEPLOYMENT.md` has the full table; `examples/.env.example` at the repo root is the
+`docs/DEPLOYMENT.md` has the full table; [.env.example](../.env.example) at the repo root is the
 checklist. The groups:
 
 | Group | Variables |
 | --- | --- |
 | **Signers** (testnet) | `FACILITATOR_SECRET` or `FACILITATOR_SECRETS` (pool), optional `FEE_BUMP_SECRET` |
 | **Signers** (pubnet, opt-in) | `ENABLE_PUBNET=true`, `FACILITATOR_SECRET_PUBNET` / `FACILITATOR_SECRETS_PUBNET`, optional `FEE_BUMP_SECRET_PUBNET`, required `STELLAR_RPC_URL_PUBNET` |
-| **Network / fees** | `STELLAR_RPC_URL` (testnet RPC, defaults to public), `MAX_TX_FEE_STROOPS`, `MAX_TX_FEE_STROOPS_PUBNET` |
+| **Network / fees** | `STELLAR_RPC_URL` (testnet RPC, defaults to public), `MAX_TX_FEE_STROOPS`, `MAX_TX_FEE_STROOPS_PUBNET`, `HORIZON_URL`, `HORIZON_URL_PUBNET` |
 | **Caller auth** | `FACILITATOR_API_KEYS` (unset = open mode) |
 | **Rate limits / metering** | `RATE_LIMIT_GLOBAL`, `RATE_LIMIT_<keyId>` per-key overrides, `RATE_LIMIT_STORE`, `DATABASE_URL`, `REDIS_URL` |
 | **HTTP / CORS / proxy** | `PORT`, `CORS_ALLOWED_ORIGINS`, `TRUST_PROXY`, `NODE_ENV` |
@@ -226,11 +226,15 @@ Full detail: [`docs/OPERATIONS.md`](./OPERATIONS.md).
 
 ### Discovery caching
 
-`GET /discovery/resources` and `GET /discovery/search` are the polled half of the
-service — agents, Bazaar crawlers and dashboards hit them in loops, and every
-`/discovery/search` miss re-embeds the query and re-scores the catalog. Both routes
-therefore send caching validators so an unchanged poll costs a header comparison
-instead of the ranking path (#200):
+`GET /discovery/resources`, `GET /discovery/resource` and `GET /discovery/search`
+are the polled half of the service — agents, Bazaar crawlers and dashboards hit
+them in loops, and every `/discovery/search` miss re-embeds the query and
+re-scores the catalog. All three therefore send caching validators so an
+unchanged poll costs a header comparison instead of the ranking path (#200):
+
+The point read is the exception to "unchanged": a `404` is answered **without**
+cache headers, because a cached "this listing does not exist" would keep every
+reader misinformed for the whole max-age after the seller registers it (#222).
 
 - `Cache-Control: public, max-age=<n>, stale-while-revalidate=<m>` — configured via
   `DISCOVERY_CACHE_MAX_AGE_SECONDS` (default 60) and
@@ -355,7 +359,8 @@ restarting it (see [`docs/DEPLOYMENT.md`](./DEPLOYMENT.md) § Rollback).
   vars, shared stores, sizing, rollback.
 - [`docs/OPERATIONS.md`](./OPERATIONS.md) — rate limiting, metering, multi-signer pool,
   health endpoints in depth.
-- [`docs/AUTHENTICATION.md`](./AUTHENTICATION.md) — caller auth, open mode, CORS.
+- [`docs/AUTHENTICATION.md`](./AUTHENTICATION.md) — caller auth, open mode, CORS, and the
+  `/admin/dlq` operator routes for inspecting, replaying, or discarding dead letters.
 - [`docs/CONFORMANCE.md`](./CONFORMANCE.md) — what "conforms" means and how it is kept
   honest.
 - [`docs/THREAT-MODEL.md`](./THREAT-MODEL.md) — what the service assumes and defends.
