@@ -45,6 +45,18 @@ restarts — see docs/DEPLOYMENT.md ("Shared Rate-Limit State").
 
 ## Configuration
 
+### API keys
+
+Keys are configured in `FACILITATOR_API_KEYS` as `id:secret` pairs, comma-separated. Three rules apply at boot (#207):
+
+- **The secret must be at least 32 characters.** The digest is a single unsalted SHA-256, which is not a work factor, so the secret's own entropy is the whole of the key's strength. A shorter secret fails the boot with the offending id and a generator command. This is a **breaking change**: a deployment with short keys will not start until they are regenerated with `openssl rand -base64 32`.
+- **An optional third field is an expiry, in epoch seconds** — `admin:<secret>:1798761600`. Epoch, not ISO-8601, because the separator is `:` and an ISO timestamp contains colons of its own. Expiry is enforced **per request**: a long-running process stops accepting the key the moment it lapses, with no redeploy.
+- **A key listed in `FACILITATOR_REVOKED_API_KEYS`** (a comma-separated list of key *ids*) is refused on every request with `revoked_api_key`. Listing the id rather than deleting the line keeps the revocation reviewable and keeps the secret out of git history as a "deleted" line. A listed id that matches no configured key logs a warning at boot — usually a typo, which would otherwise revoke nothing at all.
+
+Both refusals are distinct from an unknown key: `revoked_api_key` and `expired_api_key` say the key existed, `invalid_api_key` says it never matched. See docs/AUTHENTICATION.md.
+
+## Rate Limits
+
 Rate limits are configured via environment variables. There is a global default, and you can apply overrides per API key. 
 
 Limits are expressed as comma-separated `key=value` pairs.
@@ -132,7 +144,7 @@ A resource server debugging a failed payment hands us a single `X-Request-Id` ra
 
 ### Metrics (`GET /metrics`)
 
-Prometheus text format, unauthenticated. By default it is served on `PORT`; set `METRICS_PORT` to bind it to a separate listener (typically an internal interface) so it is not on the public surface. Series:
+Prometheus text format, unauthenticated. By default it is served on `PORT`; set `METRICS_PORT` to bind it to a separate listener so it is not on the public surface. The dedicated listener binds to `METRICS_HOST` (default `127.0.0.1` loopback) — it is reachable only from the local host unless you opt into a wider bind such as `0.0.0.0` behind a firewall or on an internal interface. Both the app `GET /metrics` route and the dedicated listener serve the identical exposition (registry plus signer-selection series). Series:
 
 `active_verifications` is a process-wide gauge of calls currently waiting on the upstream Stellar verification operation. It is the custom metric used by the Kubernetes HPA. Apply `deploy/kubernetes/active-verifications-hpa.yaml` and install Prometheus Adapter with `deploy/kubernetes/prometheus-adapter-values.yaml` to expose it through the Kubernetes custom metrics API.
 
@@ -143,10 +155,12 @@ Prometheus text format, unauthenticated. By default it is served on `PORT`; set 
 | `x402_settlements_total` | counter | `network`, `outcome` (`settled`/`failed`) | settlement success rate | alert if `outcome="failed"` rate > 1% over 10m |
 | `x402_settlement_fee_stroops` | histogram | `network` | **actual fee paid** — the number that shows whether `MAX_TX_FEE_STROOPS` is sane | alert if p95 fee approaches `MAX_TX_FEE_STROOPS` (fee ceiling about to throttle settlements) |
 | `x402_rpc_retries_total` | counter | `code`, `host` | Soroban RPC connection-level retries | alert if rate > 0 for a host over several minutes (RPC degradation / IPv6 dead-ends) |
-| `x402_signer_inflight` | gauge | `network`, `signer` | in-flight settlements per signer — **the sequence-contention signal (#9)** | alert if it sits at ≥ 1 persistently or climbs (signer pool needed before bursty traffic) |
+| `x402_signer_inflight` | gauge | `network`, `signer` | in-flight settlements per signer — **the sequence-contention signal (#9)** | alert when it sits at or above the modelled knee (§ [Where a single signer stops keeping up](#where-a-single-signer-stops-keeping-up-203)) for a sustained window, not on any non-zero reading — see that section for why `≥ 1` fires on healthy traffic |
+| `x402_signer_selected_total` | counter | `network`, `signer` | total signer selections — the stuck-signer signal alongside `x402_signer_inflight` above; served on both the app and the dedicated metrics listener | alert when a signer's counter stops incrementing while peers advance (desynced sequence), or when `x402_signer_inflight` for that signer stays non-zero past max settlement latency |
 | `active_verifications` | gauge | none | process-wide number of verification calls waiting on Stellar Horizon | HPA target is 5 average active verifications per pod |
+| `x402_catalog_cache_lookups_total` | counter | `tier` (`l1`/`l2`), `outcome` (`hit`/`miss`/`error`) | catalog search cache effectiveness (#392) — the Postgres CPU signal | `l1` hit ratio persistently low with `CATALOG_SEARCH_CACHE=1` means the LRU is too small or queries are too varied; any `outcome="error"` means Redis is timing out (the cache is bypassed, not wrong) |
 
-Operational endpoints (`/metrics`, `/healthz`, `/health/ready`) are logged but excluded from `x402_requests_total` so the payment counters stay semantically about payments.
+Operational endpoints (`/metrics`, `/healthz`, `/readyz`) are logged but excluded from `x402_requests_total` so the payment counters stay semantically about payments.
 
 ## Multi-Signer Pool Management (#9)
 
@@ -195,6 +209,57 @@ If a specific signer's `x402_signer_selected_total` counter stops incrementing w
 
 To add a new signer to the pool, generate and fund a new Stellar account, append its secret key to `FACILITATOR_SECRETS`, and restart the facilitator process. Boot validation ensures that malformed or duplicate secret keys are rejected before accepting traffic.
 
+### Where a single signer stops keeping up (#203)
+
+"I need another signer" is a claim about a specific number, and until now this
+document never named it: the alert above fired at `x402_signer_inflight ≥ 1`,
+which is a non-zero reading on a *healthy* single signer mid-settlement. An
+operator paging on that learns to ignore the alert.
+
+The number comes from a model, `npm run bench:signer`
+(`scripts/bench-signer-contention.mjs`). It is a model, not a load test —
+reproducing sequence contention faithfully needs funded accounts driven to the
+exact `tx_bad_seq` boundary, which is slow, flaky, and cannot be swept into a
+curve. Every parameter is a flag, so replace the defaults with your own:
+
+```bash
+npm run bench:signer
+npm run bench:signer -- --submit-ms 2000 --sequence-window 1
+```
+
+With the defaults (a sequence window of 8 and a 2500 ms round trip):
+
+| Offered in-flight | Settled/sec | Stable? |
+|---|---|---|
+| 4 | 1.600 | yes |
+| 8 | **3.200** | yes — the knee |
+| 9 | 2.844 | no (+2000 backlogged) |
+| 16 | 1.600 | no (+16000 backlogged) |
+
+**Ceiling: 3.2 settlements/sec (192/min) per signer, knee at 8 in-flight.**
+Past the knee throughput *falls* rather than flattening: the excess submissions
+still cost a round trip to be rejected, so a growing share of a fixed budget is
+spent on `tx_bad_seq` while the unserved queue grows without bound.
+
+Two caveats, stated rather than buried:
+
+- **The 8-deep window is optimistic.** It assumes the account can have several
+  transactions built on consecutive sequence numbers outstanding at once. With
+  `--sequence-window 1` — a fully serialized account, the conservative
+  assumption — the ceiling is 0.4/sec, which is exactly what the sizing formula
+  above computes (pool = rate × latency, so rate = 1/2.5s per signer). Use that
+  number if you have not verified that your submission path pre-allocates and
+  orders sequence numbers.
+- **The model's default round trip (2500 ms) already exceeds the 2000 ms p95
+  target** in the metrics table above. No concurrency level meets that SLO
+  while a settlement takes 2500 ms; the harness prints this rather than
+  reporting a ceiling that quietly contradicts the documented target.
+
+Alert on the knee, not on non-zero: page when `x402_signer_inflight` sits at or
+above the window you have chosen for a sustained window, or when
+`x402_settlements_total{outcome="failed"}` shows `tx_bad_seq`-shaped failures
+climbing — that is contention, not a stuck signer.
+
 ---
 
 # Availability, External Monitoring & Status (issue #19)
@@ -206,7 +271,7 @@ To add a new signer to the pool, generate and fund a new Stellar account, append
 > the status page reports `no_sla` — that is the honest state, not a failure to
 > measure. The whole point of this issue is to make "we don't know" impossible to
 > hide: see the org's own silent indexer outage that lost 207 ledgers
-> ([incident history](status/incidents.json)).
+> ([incident history](../status/incidents.json)).
 
 ## Numeric availability & latency targets
 
@@ -300,7 +365,7 @@ recipient** with a documented **escalation path**.
 | Settlement store unavailable | SEV1 | Facilitator On-Call | page; `/settle` already refuses fast (`settlement_store_unavailable`) |
 
 **Named recipient.** The recipient is the **Accensa Facilitator On-Call**,
-reachable through the channels in [`SUPPORT.md`](SUPPORT.md) (Telegram / Discord)
+reachable through the channels in [`SUPPORT.md`](../SUPPORT.md) (Telegram / Discord)
 and the `FACILITATOR_ONCALL_EMAIL` secret. On-call rotation is owned by the
 Accensa maintainers. **Escalation** is always: On-Call → Accensa maintainers →
 org owners; the same channels are the human escalation path, so a rotated invite

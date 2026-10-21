@@ -134,6 +134,8 @@ keeps open-mode callers out of each other's buckets.
 | `STELLAR_RPC_URL_PUBNET` | Yes (if pubnet) | A provider URL is required for pubnet (see RPC Provider Decision). |
 | `MAX_TX_FEE_STROOPS` | No | Fee ceiling per settlement on testnet (default `50000`). |
 | `MAX_TX_FEE_STROOPS_PUBNET`| No | Fee ceiling per settlement on pubnet (default `50000`). |
+| `HORIZON_URL` | No | Horizon base URL for `/fee_stats` dynamic fee estimation on testnet (default `https://horizon-testnet.stellar.org`). Stats are cached for 5s; estimates are clamped to `MAX_TX_FEE_STROOPS`. |
+| `HORIZON_URL_PUBNET` | No | Same, for pubnet (default `https://horizon.stellar.org`). |
 | `FACILITATOR_API_KEYS` | No | Comma-separated API keys. Unset means open (correct for free testnet). |
 | `ENABLE_PUBNET` | No | Set to `true` to enable pubnet. |
 | `FACILITATOR_SECRET_PUBNET`| Yes (if pubnet) | `S…` secret for the pubnet signer. |
@@ -268,7 +270,9 @@ Security-relevant events — settlements (with transaction hash), verifications,
 catalog writes, authentication failures, and rate-limit rejections — are
 recorded as structured JSON lines with `"channel": "audit"`, separable from
 diagnostic logs. Set `AUDIT_LOG_FILE` to mirror them to a file with its own
-retention handling. See `docs/AUDIT.md` for the event catalogue and retention.
+retention handling. If that path cannot be written, the service logs one
+warning and keeps writing audit records to stdout; it does not fail boot. See
+`docs/AUDIT.md` for the event catalogue and retention.
 
 ## Horizontal Scalability
 
@@ -390,10 +394,13 @@ npm run db:seed-legacy
 psql "$DATABASE_URL" -f migrations/001_bazaar_catalog.sql
 psql "$DATABASE_URL" -f migrations/002_idempotency_keys.sql
 psql "$DATABASE_URL" -f migrations/002_rate_limit_buckets.sql
+psql "$DATABASE_URL" -f migrations/003_settlement_store.sql
+psql "$DATABASE_URL" -f migrations/004_outbox_events.sql
+psql "$DATABASE_URL" -f migrations/004_settlement_events.sql
 ```
 
 After using the legacy approach on an existing database, run `db:seed-legacy`
-to register the tables in the node-pg-migrate tracking table.
+to register all six migration table entries in the node-pg-migrate tracking table.
 
 **Rolling back a migration:**
 

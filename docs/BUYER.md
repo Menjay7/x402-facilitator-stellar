@@ -18,7 +18,7 @@ By the end you will have:
 
 On Stellar an account can only hold — and therefore only spend — an issued asset (USDC, any SEP-41 token) once it has authorized the issuer with a **trustline** (`changeTrust`). Native XLM needs no trustline. The facilitator sponsors the network fee, so the buyer needs **only the payment asset**: the XLM for transaction fees is paid by the facilitator, but the payment asset itself must be trusted *and funded* on your account.
 
-- **Testnet:** `npm run fund:testnet` funds a fresh account and opens the USDC trustline on it in one step. If the seller prices in a different asset, add a trustline for that asset the same way (a `changeTrust` for that issuer).
+- **Testnet:** `npm run testnet:fund` funds a fresh account and opens the USDC trustline on it in one step. If the seller prices in a different asset, add a trustline for that asset the same way (a `changeTrust` for that issuer).
 - **Mainnet:** the same `changeTrust` operation, with the mainnet network passphrase and the issuer of the asset the listing actually prices in. Friendbot does not exist on pubnet — funding comes from an exchange withdrawal or an account that already holds the asset.
 
 The most common first-payment failure on Stellar is a missing trustline on either side of the transfer. When you hit it, the transaction dies in simulation and reads as a generic failure; checking the listing's `asset` and confirming both accounts trust it is the fix.
@@ -49,7 +49,7 @@ stellar keys show agent --secret   # the S... secret, used everywhere below
 The buyer guide's examples use the environment variable `AGENT_PAYER_SECRET_KEY` for
 that secret. If the resource you are buying is priced in USDC, your account also needs
 a USDC trustline and a few USDC — see the trustline snippet in
-[`docs/SELLER.md`](./SELLER.md#2-trustlines-what-your-account-must-hold) (it applies to
+[`docs/SELLER.md`](./SELLER.md#trustlines) (it applies to
 the payer too). Friendbot does not fund USDC, so for USDC-priced testnet resources you
 need testnet USDC from Circle's faucet or a friend who has it.
 
@@ -70,6 +70,12 @@ curl -s "http://localhost:3402/discovery/search?query=joke" | jq '.resources[] |
 
 ```bash
 curl -s "http://localhost:3402/discovery/resources?type=http&network=stellar:testnet&limit=10" | jq '.items[] | {url, serviceName, pricing}'
+```
+
+**Read one** by URL, when you already know what you want — no paging the whole catalog:
+
+```bash
+curl -s "http://localhost:3402/discovery/resource?url=http%3A%2F%2Fapi.ex%2Fpaid" | jq '.resource'
 ```
 
 The catalog is populated automatically off the payment path when a seller's endpoint

@@ -339,11 +339,25 @@ Inputs pinned (same locked dependencies as every run here):
 | Input | Value |
 |---|---|
 | Command | `npm run e2e:smart-account` |
-| Fixture | `test/fixtures/smart_account.wasm` — contract source in `test/fixtures/smart-account/` (`Cargo.toml` pins `soroban-sdk 27.0.6`, the protocol line testnet runs today); build/deploy steps in its `README.md` |
+| Fixture | `test/fixtures/smart_account.wasm` — contract source in `test/fixtures/smart-account/` (`Cargo.toml` pins `soroban-sdk 27.0.6`, the protocol line testnet runs today); build/deploy steps in its `README.md`. Setting `SMART_ACCOUNT_WASM` (see `.env.example`) points the run at a rebuilt fixture without overwriting the committed wasm. |
 | `@stellar/stellar-sdk` | `^16.2.0` (locked) |
 | `@x402/stellar` (verify/settle) | `^2.23.0` (locked) |
 | Payer | deployed contract account (C-address) owning the transfer; three instances: no cap, cap `1,000,000` stroops, cap `500` stroops |
 | Asset / amount | XLM (SAC) / 1,000 stroops, facilitator-sponsored fee |
+| Runs in CI | **No** — operator-triggered only. No workflow under `.github/` invokes this command (`git grep -n 'e2e:smart-account\|e2e-smart-account' .github/` returns no matches), and it needs live testnet (funding by friendbot), so it cannot join the `ci` job |
+
+The run is operator-triggered only. Before running it, the operator needs:
+
+* Reachable testnet RPC — `STELLAR_RPC_URL` (defaults to `https://soroban-testnet.stellar.org`).
+* Reachable friendbot — `FRIENDBOT_URL` (defaults to `https://friendbot.stellar.org`). The script generates fresh keypairs per run (deployer, owner, merchant, facilitator) and friendbot funds the classic accounts itself, so no `*_SECRET`-style payer secret, no pre-existing funded account, and no saved fixture state has to be supplied.
+* The built contract fixture — `test/fixtures/smart_account.wasm` is committed; `SMART_ACCOUNT_WASM` can point at a local build of `test/fixtures/smart-account/` instead.
+* `FACILITATOR_URL` is optional: when unset, the script spawns its own facilitator on a random port and tears it down at the end.
+
+The run is wired into CI: `.github/workflows/conformance-run.yml` executes
+`npm run e2e:smart-account` after the upstream suite and reports its pass/fail
+in the job summary (see the `conformance-output` artifact for the captured
+log). It needs no secrets — it self-funds through friendbot and spawns its own
+facilitator — so the prerequisites below apply only to a manual run.
 
 Results:
 
@@ -575,7 +589,7 @@ Two distinct things drift, and they are watched by two mechanisms:
 | --- | --- | --- | --- |
 | Nightly (daily) | Conformance run against `x402-foundation/x402@main` | CI, no human in the loop | Failure opens/updates a tracking issue with the run URL (workflow change tracked in [#192](https://github.com/accensa/x402-facilitator-stellar/issues/192)) |
 | Weekly | Spec-drift job diffs tracked spec files against `docs/UPSTREAM.md` baseline; opens an issue on change | CI opens; a maintainer reviews within the week | Issue triaged within 5 working days |
-| `@x402/*` bump PR | Conformance job runs against the PR; the PR is blocked on its failure | CI gate; maintainer merges or reverts | Before merge — a red conformance build never merges |
+| `@x402/*` bump PR | Nothing runs automatically. `conformance-on-bump.yml` was deleted after it was measured to have produced zero runs ever (its `branches: ["renovate/**"]` filter matched the PR *base*, which is never a renovate branch) | Maintainer requests a `workflow_dispatch` conformance run on the bump PR | Before merge, by review — there is no machine gate, and `main` has no branch protection |
 | Upstream release notice | Release notes / npm advisory | Maintainer review | Reviewed before the next scheduled run |
 
 Ownership: the drift issue is assigned to a named maintainer at all times; an

@@ -9,6 +9,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createApp } from '../../src/app.js';
+import { MIN_API_KEY_LENGTH } from '../../src/config.js';
 import { stubRateLimiter } from './rate-limiter.js';
 
 // Re-exported so existing importers keep one entry point; the definition lives
@@ -16,10 +17,22 @@ import { stubRateLimiter } from './rate-limiter.js';
 export { stubRateLimiter };
 
 /**
+ * A secret long enough to satisfy the production floor (#207).
+ *
+ * Tests write `admin:${TEST_SECRET}` rather than a short literal so the key
+ * they configure is one `resolveConfig` would actually accept — a suite that
+ * authenticates with a secret production refuses to boot on is testing a
+ * configuration that cannot exist.
+ */
+export const TEST_SECRET = 'test-secret-0123456789abcdefghijklmnop';
+
+/**
  * Builds the config shape createApp expects.
  *
  * API keys are given as `id:secret` and hashed here the way resolveConfig does,
- * so a test states the secret it will present rather than a digest.
+ * so a test states the secret it will present rather than a digest. The
+ * minimum-length rule is enforced here too (#207), for the same reason: the
+ * helper must not be able to build a key the real parser would reject.
  */
 export function testConfig({
   apiKeys = [],
@@ -35,6 +48,11 @@ export function testConfig({
     apiKeys: apiKeys.map(entry => {
       const idx = entry.indexOf(':');
       const [id, secret] = idx > 0 ? [entry.slice(0, idx), entry.slice(idx + 1)] : ['key_0', entry];
+      assert.ok(
+        secret.length >= MIN_API_KEY_LENGTH,
+        `testConfig: secret for "${id}" is ${secret.length} characters; ` +
+          `the production floor is ${MIN_API_KEY_LENGTH} (#207). Use TEST_SECRET.`,
+      );
       return { id, hash: createHash('sha256').update(secret).digest() };
     }),
     networks,
@@ -99,22 +117,40 @@ export async function serve({
     { distributedLock, webhooks, ...extras },
   );
 
-  // Fastify's listen resolves with the bound address once the server is up.
-  await app.listen({ port: 0, host: '127.0.0.1' });
-  const base = `http://127.0.0.1:${app.server.address().port}`;
+  await app.ready();
+
+  const adapt = res => ({
+    status: res.statusCode,
+    headers: { get: name => res.headers[name.toLowerCase()] ?? null },
+    json: async () => res.json(),
+    text: async () => res.payload,
+  });
 
   return {
-    base,
     app,
-    close: () => app.close(),
-    get: (path, headers = {}) => fetch(`${base}${path}`, { headers }),
-    post: (path, body, headers = {}) =>
-      fetch(`${base}${path}`, {
+    close: async () => app.close(),
+    get: async (path, headers = {}) => {
+      const res = await app.inject({ method: 'GET', url: path, headers });
+      return adapt(res);
+    },
+    post: async (path, body, headers = {}) => {
+      const res = await app.inject({
         method: 'POST',
+        url: path,
         headers: { 'content-type': 'application/json', ...headers },
-        body: typeof body === 'string' ? body : JSON.stringify(body),
-      }),
-    request: (path, options = {}) => fetch(`${base}${path}`, options),
+        payload: typeof body === 'string' ? body : JSON.stringify(body),
+      });
+      return adapt(res);
+    },
+    request: async (path, options = {}) => {
+      const res = await app.inject({
+        method: options.method || 'GET',
+        url: path,
+        headers: options.headers || {},
+        payload: options.body,
+      });
+      return adapt(res);
+    },
   };
 }
 

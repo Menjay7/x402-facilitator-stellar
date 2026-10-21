@@ -16,6 +16,8 @@
  *   x402_signer_inflight{network,signer}
  *   x402_dlq_depth{status} - dead-letter queue depth; alert if pending+exhausted
  *     exceeds DLQ_ALERT_THRESHOLD (see src/dlq/worker.js)
+ *   x402_catalog_cache_lookups_total{tier,outcome} - catalog search cache hits,
+ *     misses and errors per tier (see src/catalog/cache.js, #392)
  */
 
 const DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
@@ -192,6 +194,11 @@ export function createMetrics() {
     'Dead-letter queue depth by status (pending, exhausted). Alert when pending+exhausted exceeds DLQ_ALERT_THRESHOLD.',
     ['status'],
   );
+  const catalogCache = new Counter(
+    'x402_catalog_cache_lookups_total',
+    'Catalog search cache lookups by tier (l1|l2) and outcome (hit|miss|error). Hit ratio per tier is the Postgres-CPU signal (#392); a rising l2 error rate means Redis is timing out, not that the cache is cold.',
+    ['tier', 'outcome'],
+  );
 
   const activeVerifications = new Gauge(
     'active_verifications',
@@ -199,6 +206,34 @@ export function createMetrics() {
     [],
   );
   activeVerifications.set({}, 0);
+
+  // CQRS projection metrics
+  const projectionLag = new Gauge(
+    'x402_projection_lag',
+    'Number of events behind the event stream (projection lag).',
+    [],
+  );
+  projectionLag.set({}, 0);
+
+  const projectionEventsProcessed = new Counter(
+    'x402_projection_events_processed_total',
+    'Total number of events processed by the projection worker.',
+    [],
+  );
+
+  const projectionBatchDuration = new Histogram(
+    'x402_projection_batch_duration_seconds',
+    'Duration of projection batch processing in seconds.',
+    [],
+    DURATION_BUCKETS,
+  );
+
+  const projectionThroughput = new Gauge(
+    'x402_projection_throughput_events_per_second',
+    'Projection throughput in events/second, observed over the most recent completed projection batch (its processed count divided by its wall duration); the worker in src/settlement-cqrs.js sets it, so averaging the scrape across polls reconstructs the steady-state rate.',
+    [],
+  );
+  projectionThroughput.set({}, 0);
 
   return {
     incRequests: labels => requests.inc(labels),
@@ -211,8 +246,20 @@ export function createMetrics() {
     setSignerInflight: ({ network, signer, value }) =>
       signerInflight.set({ network, signer }, value),
     setDlqDepth: ({ status, value }) => dlqDepth.set({ status }, value),
+    /**
+     * Records one catalog-cache lookup. Sink for `CatalogSearchCache`'s
+     * `onLookup` option; see src/catalog/cache.js.
+     */
+    incCatalogCacheLookup: ({ tier, outcome }) =>
+      catalogCache.inc({ tier: tier ?? 'unknown', outcome: outcome ?? 'unknown' }),
     incActiveVerifications: () => activeVerifications.inc({}),
     decActiveVerifications: () => activeVerifications.dec({}),
+
+    // CQRS projection metrics
+    setProjectionLag: lag => projectionLag.set({}, lag),
+    incProjectionEventsProcessed: count => projectionEventsProcessed.inc({}, count),
+    observeProjectionBatchDuration: duration => projectionBatchDuration.observe({}, duration),
+    setProjectionThroughput: throughput => projectionThroughput.set({}, throughput),
 
     render: () =>
       [
@@ -223,7 +270,12 @@ export function createMetrics() {
         rpcRetries,
         signerInflight,
         dlqDepth,
+        catalogCache,
         activeVerifications,
+        projectionLag,
+        projectionEventsProcessed,
+        projectionBatchDuration,
+        projectionThroughput,
       ]
         .map(m => m.render())
         .join(''),
@@ -285,6 +337,14 @@ class SignerMetrics {
 
   /**
    * Generate Prometheus formatted metrics text.
+   *
+   * x402_signer_inflight is deliberately NOT rendered here: the registry gauge
+   * fed by `setSignerInflight` is that series' single owner, and GET /metrics
+   * concatenates this text after `createMetrics().render()`. A second HELP/TYPE
+   * pair for the same name made the exposition declare the series twice — a
+   * scrape-time parse error — and the private inflight map disagreed with the
+   * registry gauge because nothing feeds it (see #558). The selection counter
+   * is the only series this class uniquely owns.
    * @returns {string}
    */
   toPrometheusText() {
@@ -294,14 +354,9 @@ class SignerMetrics {
     ];
 
     for (const { network, signer, count } of this.selectedTotal.values()) {
-      lines.push(`x402_signer_selected_total{network="${network}",signer="${signer}"} ${count}`);
-    }
-
-    lines.push('# HELP x402_signer_inflight Current in-flight settlements per signer.');
-    lines.push('# TYPE x402_signer_inflight gauge');
-
-    for (const { network, signer, count } of this.inflight.values()) {
-      lines.push(`x402_signer_inflight{network="${network}",signer="${signer}"} ${count}`);
+      lines.push(
+        `x402_signer_selected_total{network="${escapeLabelValue(network)}",signer="${escapeLabelValue(signer)}"} ${count}`,
+      );
     }
 
     return lines.join('\n') + '\n';

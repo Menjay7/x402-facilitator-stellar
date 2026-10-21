@@ -38,6 +38,48 @@ curl "https://facilitator.example.com/discovery/resources?type=mcp&limit=10"
 }
 ```
 
+## API: `GET /discovery/resource`
+
+Reads a **single** entry, keyed by its URL — the point lookup behind the listing (#222). A caller who already knows the URL does not have to page the whole catalog to find it. Pass `toolName` to disambiguate two tools sharing one MCP server URL.
+
+Unauthenticated, like the other discovery reads. A missing `url` is a `400`; an unknown `url` is a `404` with reason `resource_not_found`, deliberately sent **without** cache headers — a cached "does not exist" would outlive the seller's registration and keep every reader misinformed for the whole max-age.
+
+### Example
+```bash
+curl "https://facilitator.example.com/discovery/resource?url=http%3A%2F%2Fmcp.ex&toolName=search_docs"
+```
+```json
+{
+  "x402Version": 2,
+  "resource": {
+    "type": "mcp",
+    "url": "http://mcp.ex",
+    "toolName": "search_docs",
+    "serviceName": "Documentation Search",
+    "scheme": "exact",
+    "network": "stellar:testnet"
+  }
+}
+```
+
+## API: `DELETE /discovery/resource`
+
+Removes a listing outright (#221). Before this the catalog was append-only in practice: `pruneExpired` only ever hid verify-created provisional entries, and only until the next verify re-registered them.
+
+The removal is not a hide. The entry, its per-`payTo` accounting and its embedding all go, so a later `/verify` re-creates it as a fresh provisional listing rather than resurrecting the old one. The deletion is by exact key and does **not** consult the public-view filter, so an expired-but-not-yet-pruned entry — invisible to every read, yet still occupying its key — can still be removed by the only route that can name it.
+
+Authenticated and metered against the catalog-write bucket like `POST /discovery/resources`, and audited as `catalog_delete`. **Deletion is not scoped to the caller**: nothing in this service maps an API key to a `payTo`, so there is no ownership to enforce and pretending otherwise would be a check that always passes. Any valid key may remove any listing; the audit event records who did.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $KEY" \
+  "https://facilitator.example.com/discovery/resource?url=http%3A%2F%2Fapi.ex%2Fpaid"
+```
+```json
+{ "ok": true, "removed": { "url": "http://api.ex/paid", "toolName": null } }
+```
+
+A `404` with reason `resource_not_found` means nothing matched — the route does not report a removal that did not happen.
+
 ## API: `GET /discovery/search`
 
 Provides search over discovered resources, designed to be called by agents discovering tools on the fly. It takes a natural-language `query` (§3.2), with `limit`/`cursor` pagination and a `partialResults` flag.
@@ -88,6 +130,12 @@ When `EMBEDDINGS_URL` is set, a dense leg runs alongside the lexical one: the qu
 
 **Embedding model changes:** embedding responses are validated (non-empty array of finite numbers). The dimension of the first accepted vector is recorded; a later vector with a different length is rejected with an explicit error log — it means the embedding model or provider changed and the index must be rebuilt (see the re-index procedure at the end of this file). An operator changing the model should re-index rather than letting stored vectors silently mismatch every query vector.
 
+**A vector describes the text it was computed from, and nothing else (#220).** A re-cataloguing upsert builds the new entry on top of the existing one, so it inherits the previous vector. When the new content composes to different text, that vector is no longer a description of the resource, and the dense leg would go on ranking it by content that no longer exists — silently, because a failed re-embed only logs a warning.
+
+So the stale vector is dropped **synchronously**, before the embed is attempted. While the new vector is being computed the resource ranks lexically (honest) rather than densely against the wrong document (confident and wrong), and if the re-embed then fails the drop has already happened and stays. Each vector carries a fingerprint of the text it was computed from; an upsert whose text is unchanged keeps its vector and skips the embed entirely, so a verify re-touching an already-listed resource costs no provider call.
+
+The fingerprint is a change *detector*, not a security measure — a non-cryptographic 64-bit hash (FNV-1a over two lanes), sufficient to tell whether the attached vector still describes the entry, and collision-resistant enough that two genuinely different listings do not share one.
+
 #### Integrity caveat: the `+5` verified boost
 
 The boost is only meaningful if "verified" means something. Two properties of the current design weaken it, tracked separately:
@@ -105,6 +153,11 @@ Cursor pagination is implemented via the opaque `cursor` parameter (base64 `offs
 
 ### Performance Target
 The p95 latency target for this endpoint is **<50ms**, ensuring it does not block agent interactive paths.
+
+### Result Caching (#392)
+Discovery traffic is repetitive — agents poll the same handful of queries — so results are cached in two tiers when `CATALOG_SEARCH_CACHE=1`: an in-process LRU (5s) in front of a shared Redis entry (60s). This is where the Postgres saving comes from; N replicas issue one query per distinct query rather than N. See `.env.example` for the flag and `docs/OPERATIONS.md` for the `x402_catalog_cache_lookups_total` series.
+
+Caching does not weaken the freshness contract. The catalog's monotonic write version is part of the cache key, so any write makes every earlier entry unreachable immediately — no cached read can be stale, and that holds even if an invalidation message is lost. A write publishes on a Redis channel so other replicas drop their L1 immediately instead of on their next miss. Concurrent misses for the same key collapse into one catalog query, so the L1 expiry window is not also a stampede window. If Redis is unreachable the cache is bypassed and the catalog is queried directly: a cache outage can slow discovery down but cannot fail it. Responses are byte-identical to an uncached read; the cache is not observable to a client.
 
 ## Validation & Cataloging Policy
 
@@ -238,12 +291,76 @@ live listing:
 | `routeTemplate` | A wildcard or malformed-but-not-hostile template (e.g. the bare `*` the stock SDK registers by default). | Provide a concrete template with named parameters. |
 | `serviceName` | Invalid or oversized service name. | A short, plain-text name. |
 | `iconUrl` | Invalid or private-IP URL. | A public HTTPS icon URL. |
-| `description_truncated` | Description contained HTML or exceeded 200 characters. | Short, plain text. |
+| `description` | The description contained markup (a tag, or an entity-encoded one such as `&lt;script&gt;`). See [why refusal replaces sanitising](#why-a-description-with-markup-is-refused-not-sanitised). | Plain text, no HTML and no HTML entities. |
 | `tags_filtered` | Invalid or oversized tags were dropped. | Fewer, well-formed tags. |
+
+#### Why a description with markup is refused, not sanitised
+
+The catalog used to strip tags with a regex and keep what survived. That is a
+sanitiser, and a regex cannot be a security boundary:
+
+- `<scr<script>ipt>` strips to `<script>` — the filter manufactures the tag it
+  was meant to remove.
+- `&lt;script&gt;` is not matched at all, and is markup to every consumer that
+  entity-decodes.
+- `<img src=x onerror=alert(1)` with no closing `>` was swallowed silently by
+  the pattern's optional tail, so the seller was never told anything had been
+  removed.
+
+A description is prose. Refusing a value that needs angle brackets to say what
+it means is the only policy that holds, so the field is dropped and the rest of
+the listing still lands (`partially landed`). Plain prose is unaffected — a
+bare `&`, as in "Weather & tides", is not markup and is kept.
+
+### Truncated fields (reported separately from drops)
+
+A field the catalog **stored, shortened** is not a dropped field, and reporting
+it as one was wrong on the wire (#219): `reason` would read
+`Dropped fields: description_truncated`, sending a seller to look for a field
+that was still in the catalog — and naming a field that does not exist.
+
+Truncations travel in a separate `truncated` array on the envelope instead, and
+also leave the status at `partially landed`:
+
+```json
+{ "bazaar": { "status": "partially landed", "code": "catalog_partial",
+              "reason": "Truncated fields: description",
+              "truncated": ["description"] } }
+```
+
+| Field in `truncated` | What happened | Fix |
+|---|---|---|
+| `description` | Kept, but cut to the 200-character index limit. The cut never splits an astral character, so the stored value is always valid UTF-16. | Keep descriptions under 200 characters. |
+
+`POST /discovery/resources` reports both lists separately in its response body
+(`softDrops` and `truncations`).
 
 The codes above are extracted from `src/catalog/validation.js` and
 `src/app.js`, and `test/extension-responses-doc.test.js` fails if a code is
 added to the cataloging path without being documented here.
+
+### Header size
+
+The envelope is encoded into the `EXTENSION-RESPONSES` response header, which
+is bounded (#202). The value is base64 of the JSON, so it is 4/3 the size of
+the JSON plus the envelope, and every hop in the request path caps headers:
+nginx to 8 KiB by default, Envoy to 60 KiB, common HTTP/2 stacks to 16 KiB. A
+header over the cap does not arrive truncated — the proxy answers **502** or
+drops the connection, on the payment path, for a payment that has already
+settled. The buyer's money moves and the response explaining it never arrives.
+
+So the header is capped at **4096 bytes** and degrades in tiers rather than
+failing:
+
+| Tier | When | What the client receives |
+|---|---|---|
+| 1 | The envelope fits. | The envelope exactly as described above — byte-for-byte what an unbounded encoder would have produced. |
+| 2 | It does not fit. | The same envelope with `reason` removed and `"detail_omitted": true` added. |
+| 3 | It still does not fit (a non-`reason` field was enormous). | `{ "status": ..., "code": "extension_response_omitted", "detail_omitted": true }`. |
+
+The `status` is preserved in every tier: a client learning `rejected` without
+learning why is a far better outcome than a client learning nothing. Every
+degradation is logged server-side, so an operator can see that detail was shed.
 
 ## Search Quality & Evaluation History
 
@@ -277,7 +394,7 @@ Judgements are written by humans against the *fixed* fixture catalog, before (an
 
 ### What counts as a regression
 
-The runner gates merges on two aggregate thresholds, enforced in CI on every relevant change (`eval` job in `.github/workflows/ci.yml`):
+The runner fails the CI step on two aggregate thresholds, checked on every relevant change (the `Search evaluation` step of the `ci` job in `.github/workflows/ci.yml`; `main` has no branch protection, so a red eval is reviewed rather than machine-blocked):
 
 - **nDCG ≥ 0.85**
 - **MRR ≥ 0.8**

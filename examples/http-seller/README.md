@@ -12,10 +12,10 @@ This example prices in **XLM**, the native asset, which needs **no trustline** �
 ```bash
 # From the repo root — funds three fresh testnet accounts AND opens a USDC
 # trustline on each (see scripts/fund-testnet-accounts.mjs)
-npm run fund:testnet
+npm run testnet:fund
 ```
 
-For an existing account, `npm run prepare:testnet-usdc` (with `CLIENT_STELLAR_PRIVATE_KEY` / `SERVER_STELLAR_ADDRESS` / `SERVER_STELLAR_PRIVATE_KEY` set) adds the USDC trustline — see the [Seller Guide](../../docs/SELLER.md#trustlines) for the concept, both networks, and the exact commands.
+For an existing account, `npm run testnet:usdc` (with `CLIENT_STELLAR_PRIVATE_KEY` / `SERVER_STELLAR_ADDRESS` / `SERVER_STELLAR_PRIVATE_KEY` set) adds the USDC trustline — see the [Seller Guide](../../docs/SELLER.md#trustlines) for the concept, both networks, and the exact commands.
 
 ## Prerequisites
 - Node.js >= 20
